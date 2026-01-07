@@ -4,6 +4,7 @@ import math
 from copy import deepcopy
 from hashlib import sha256
 from typing import TypedDict, Optional
+from types import SimpleNamespace
 
 import numpy as np
 from astropy import units as u
@@ -84,36 +85,41 @@ class GcrSliderAlgorithm(RoutingAlg):
                 logger.warning(f"Failed to initialize polygon land detection: {e}. Falling back to raster.")
                 self.use_polygon_detection = False
                 self.land_polygon_detector = None
+        # Debug init state
+        print(f"[GCRSLIDER] init use_polygon_detection={self.use_polygon_detection}, detector_is_none={self.land_polygon_detector is None}")
 
-    def _calculate_map_bounds(self) -> tuple[tuple[float, float], tuple[float, float]]:
+    def _calculate_map_bounds(self) -> SimpleNamespace:
         """
         Calculate bounding box for PostGIS land polygon queries.
-        Returns ((min_lat, max_lat), (min_lon, max_lon))
-        
+
+        Returns a SimpleNamespace with `lat1`, `lat2`, `lon1`, `lon2` to match
+        the structure expected by LandPolygonsCrossing.set_map_bbox.
+
         :return: Bounding box coordinates
-        :rtype: tuple[tuple[float, float], tuple[float, float]]
+        :rtype: SimpleNamespace
         """
         # Start with start and finish points
         lats = [self.start[0], self.finish[0]]
         lons = [self.start[1], self.finish[1]]
-        
+
         # Add intermediate waypoints if any
         if self.waypoints:
             for wp in self.waypoints:
                 lats.append(wp[0])
                 lons.append(wp[1])
-        
+
         # Add buffer (10% of range or 1 degree minimum)
         lat_range = max(abs(max(lats) - min(lats)), 1.0)
         lon_range = max(abs(max(lons) - min(lons)), 1.0)
         buffer = max(lat_range * 0.1, lon_range * 0.1, 1.0)
-        
+
         min_lat = max(min(lats) - buffer, -90.0)
         max_lat = min(max(lats) + buffer, 90.0)
         min_lon = max(min(lons) - buffer, -180.0)
         max_lon = min(max(lons) + buffer, 180.0)
-        
-        return ((min_lat, max_lat), (min_lon, max_lon))
+
+        # LandPolygonsCrossing expects an object with lat1/lat2/lon1/lon2 attributes.
+        return SimpleNamespace(lat1=min_lat, lat2=max_lat, lon1=min_lon, lon2=max_lon)
     
     def _check_polygon_intersection(self, lat_start: float, lon_start: float, 
                                    lat_end: float, lon_end: float) -> bool:
