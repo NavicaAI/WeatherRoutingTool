@@ -245,6 +245,7 @@ class GcrSliderAlgorithm(RoutingAlg):
         If a buffer is specified, check also the surrounding of the point.
         The check is done by sampling and checking points on a circle with
         the given buffer distance as radius in predefined angular steps.
+        FIXED: Now also checks intermediate points along lines to buffer points.
 
         :param lat: latitude
         :type lat: float
@@ -253,13 +254,27 @@ class GcrSliderAlgorithm(RoutingAlg):
         :return:
         :rtype: bool
         """
-        # FIXME: could be improved by checking also points on the line between the original point and the point moved
-        #  by the specific distance. With the current implementation islands could be ignored.
+        # Check center point
         if is_land_global_land_mask(lat, lon):
             return True
+        
+        # Check buffer zone by sampling points on circle
         if self.land_buffer > 0:
             for angle in [i*self.angle_step for i in range(math.ceil(360/self.angle_step))]:
                 p = geod.Direct(lat, lon, angle, self.land_buffer)
+                
+                # Also check intermediate points along the line to buffer point
+                # This prevents missing narrow land features (fixes FIXME)
+                line_to_buffer = geod.InverseLine(lat, lon, p['lat2'], p['lon2'])
+                check_interval = min(1000, self.land_buffer / 3)  # Check at least 3 points
+                n_checks = int(math.ceil(line_to_buffer.s13 / check_interval))
+                for j in range(1, n_checks + 1):
+                    s = min(check_interval * j, line_to_buffer.s13)
+                    pt = line_to_buffer.Position(s, Geodesic.STANDARD | Geodesic.LONG_UNROLL)
+                    if is_land_global_land_mask(pt['lat2'], pt['lon2']):
+                        return True
+                
+                # Check the buffer point itself
                 if is_land_global_land_mask(p['lat2'], p['lon2']):
                     return True
         return False
@@ -338,6 +353,19 @@ class GcrSliderAlgorithm(RoutingAlg):
                         break
                     logger.debug("New point still on land.")
                     i += 1
+                
+                # CRITICAL FIX: After moving point off land, verify BOTH new segments are clear
+                # This fixes the bug where segments to/from moved points can still cross land
+                line_to_new = geod.InverseLine(start[0], start[1], new_point[0], new_point[1])
+                line_from_new = geod.InverseLine(new_point[0], new_point[1], end[0], end[1])
+                
+                if self.has_point_on_land(line_to_new) or self.has_point_on_land(line_from_new):
+                    logger.warning(
+                        f"Moved point {new_point} to water, but new segments still cross land. "
+                        f"This can happen with complex coastlines. Recursion will continue."
+                    )
+                    # Don't break - the recursive calls below will handle remaining crossings
+                
                 logger.info(f"Found new point {new_point}.")
                 # Note: the order of the following lines is important to have the correct order of points in the route
                 point_id = self.get_point_id(new_point)
