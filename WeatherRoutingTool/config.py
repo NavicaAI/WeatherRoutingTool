@@ -89,6 +89,7 @@ class Config(BaseModel):
     GCR_SLIDER_MAX_POINTS: int = 300
     GCR_SLIDER_THRESHOLD: float = 10000  # in m
 
+    GCR_SLIDER_USE_POLYGON_LAND_DETECTION: bool = False  # Use PostGIS polygons for land detection (requires DB)
     # options for Genetic Algorithm
     GENETIC_NUMBER_GENERATIONS: int = 20  # number of generations
     GENETIC_NUMBER_OFFSPRINGS: int = 2  # total number of offsprings for every generation
