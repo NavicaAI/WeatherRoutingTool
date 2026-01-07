@@ -196,3 +196,31 @@ Our FastAPI wrapper: `/services/weather-routing/app.py`
 - **License**: Apache 2.0 (same as upstream)
 
 All enhancements are offered to 52North as PRs. We welcome collaboration!
+
+## Update: Additional Optimization Needed
+
+### Testing Results (2026-01-07)
+
+After implementing the initial fix (buffer/5, min 500m checks), testing revealed the Sant Antioco 
+island case still shows 30 land crossing points on a 92km segment:
+
+```
+Sant Antioco route: (39.5, 8.0) → (38.838, 8.644)
+Land crossings: 30 points between 43.5km-66km along segment
+```
+
+This indicates the algorithm needs **even finer granularity** for detecting narrow passages 
+like the Sant Antioco channel (< 5km width).
+
+### Recommended Next Steps
+
+**Option 1: Ultra-fine line checking** (keeps PR focused)
+- Reduce to `min(250m, buffer/10)` for 4x current granularity
+- May impact performance but ensures comprehensive land detection
+
+**Option 2: Polygon GIS database** (future enhancement)
+- Use PostGIS with OSM land polygons for precise geometry checks
+- Eliminates raster resolution limitations
+- Better performance for complex coastlines
+- Recommended for production deployment
+

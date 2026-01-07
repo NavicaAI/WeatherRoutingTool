@@ -266,7 +266,7 @@ class GcrSliderAlgorithm(RoutingAlg):
                 # Also check intermediate points along the line to buffer point
                 # This prevents missing narrow land features (fixes FIXME)
                 line_to_buffer = geod.InverseLine(lat, lon, p['lat2'], p['lon2'])
-                check_interval = min(1000, self.land_buffer / 3)  # Check at least 3 points
+                check_interval = min(500, self.land_buffer / 5)  # Check every 500m or at least 5 points
                 n_checks = int(math.ceil(line_to_buffer.s13 / check_interval))
                 for j in range(1, n_checks + 1):
                     s = min(check_interval * j, line_to_buffer.s13)
