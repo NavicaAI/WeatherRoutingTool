@@ -3,7 +3,7 @@ import logging
 import math
 from copy import deepcopy
 from hashlib import sha256
-from typing import TypedDict, Optional
+from typing import TypedDict
 
 import numpy as np
 from astropy import units as u
@@ -11,11 +11,9 @@ from geographiclib.geodesic import Geodesic
 from geographiclib.geodesicline import GeodesicLine
 from global_land_mask import is_land as is_land_global_land_mask
 from shapely import line_interpolate_point, LineString
-from shapely.geometry import Point, box
-from shapely.strtree import STRtree
 
 from WeatherRoutingTool.algorithms.routingalg import RoutingAlg
-from WeatherRoutingTool.constraints.constraints import ConstraintsList, LandPolygonsCrossing
+from WeatherRoutingTool.constraints.constraints import ConstraintsList
 from WeatherRoutingTool.routeparams import RouteParams
 from WeatherRoutingTool.ship.ship import Boat
 from WeatherRoutingTool.ship.shipparams import ShipParams
@@ -68,84 +66,6 @@ class GcrSliderAlgorithm(RoutingAlg):
                 'point': self.start
             }
         }
-        
-        # Initialize polygon-based land detection (optional, requires PostGIS)
-        self.use_polygon_detection = config.GCR_SLIDER_USE_POLYGON_LAND_DETECTION
-        self.land_polygon_detector: Optional[LandPolygonsCrossing] = None
-        if self.use_polygon_detection:
-            try:
-                map_bounds = self._calculate_map_bounds()
-                self.land_polygon_detector = LandPolygonsCrossing(
-                    map_size=map_bounds,
-                    db_engine=None  # Will auto-create from WRT_DB_* env vars
-                )
-                logger.info("Polygon-based land detection enabled.")
-            except Exception as e:
-                logger.warning(f"Failed to initialize polygon land detection: {e}. Falling back to raster.")
-                self.use_polygon_detection = False
-                self.land_polygon_detector = None
-
-    def _calculate_map_bounds(self) -> tuple[tuple[float, float], tuple[float, float]]:
-        """
-        Calculate bounding box for PostGIS land polygon queries.
-        Returns ((min_lat, max_lat), (min_lon, max_lon))
-        
-        :return: Bounding box coordinates
-        :rtype: tuple[tuple[float, float], tuple[float, float]]
-        """
-        # Start with start and finish points
-        lats = [self.start[0], self.finish[0]]
-        lons = [self.start[1], self.finish[1]]
-        
-        # Add intermediate waypoints if any
-        if self.waypoints:
-            for wp in self.waypoints:
-                lats.append(wp[0])
-                lons.append(wp[1])
-        
-        # Add buffer (10% of range or 1 degree minimum)
-        lat_range = max(abs(max(lats) - min(lats)), 1.0)
-        lon_range = max(abs(max(lons) - min(lons)), 1.0)
-        buffer = max(lat_range * 0.1, lon_range * 0.1, 1.0)
-        
-        min_lat = max(min(lats) - buffer, -90.0)
-        max_lat = min(max(lats) + buffer, 90.0)
-        min_lon = max(min(lons) - buffer, -180.0)
-        max_lon = min(max(lons) + buffer, 180.0)
-        
-        return ((min_lat, max_lat), (min_lon, max_lon))
-    
-    def _check_polygon_intersection(self, lat_start: float, lon_start: float, 
-                                   lat_end: float, lon_end: float) -> bool:
-        """
-        Check if line segment intersects land polygons using LandPolygonsCrossing.
-        
-        :param lat_start: Start latitude
-        :type lat_start: float
-        :param lon_start: Start longitude
-        :type lon_start: float
-        :param lat_end: End latitude
-        :type lat_end: float
-        :param lon_end: End longitude
-        :type lon_end: float
-        :return: True if line crosses land
-        :rtype: bool
-        """
-        if self.land_polygon_detector is None:
-            return False
-        
-        try:
-            # Use check_crossing method from LandPolygonsCrossing
-            result = self.land_polygon_detector.check_crossing(
-                np.array([lat_start]),
-                np.array([lon_start]),
-                np.array([lat_end]),
-                np.array([lon_end])
-            )
-            return result[0] if result else False
-        except Exception as e:
-            logger.warning(f"Polygon intersection check failed: {e}. Falling back to raster.")
-            return False
 
     def adjust_parameters(self, line_length: float):
         """
@@ -278,8 +198,6 @@ class GcrSliderAlgorithm(RoutingAlg):
     ) -> bool:
         """
         Check if the line has a point on land.
-        If polygon detection is enabled, check direct line intersection first.
-        Otherwise, fall back to point sampling along the line.
 
         :param line:
         :type line: geographiclib.geodesicline.GeodesicLine
@@ -288,28 +206,6 @@ class GcrSliderAlgorithm(RoutingAlg):
         :return:
         :rtype: bool
         """
-        # If polygon detection is enabled, check direct line intersection
-        if self.use_polygon_detection and self.land_polygon_detector is not None:
-            try:
-                # Get start and end points from the line
-                start_pos = line.Position(0, Geodesic.STANDARD | Geodesic.LONG_UNROLL)
-                end_pos = line.Position(line.s13, Geodesic.STANDARD | Geodesic.LONG_UNROLL)
-                print(
-                    f"has_point_on_land: Checking line ({start_pos['lat2']:.4f}, {start_pos['lon2']:.4f}) -> "
-                    f"({end_pos['lat2']:.4f}, {end_pos['lon2']:.4f}) using polygons"
-                )
-                
-                if self._check_polygon_intersection(
-                    start_pos['lat2'], start_pos['lon2'],
-                    end_pos['lat2'], end_pos['lon2']
-                ):
-                    print(f"has_point_on_land: Line CROSSES LAND (polygon)")
-                    return True
-                print(f"has_point_on_land: Line is over water (polygon)")
-            except Exception as e:
-                logger.warning(f"Polygon line check failed: {e}. Using point sampling.")
-        
-        # Fallback to point sampling (original method)
         n = int(math.ceil(line.s13 / interval))
         for i in range(0, n+1):
             s = min(interval * i, line.s13)
@@ -346,7 +242,6 @@ class GcrSliderAlgorithm(RoutingAlg):
     def is_land(self, lat: float, lon: float) -> bool:
         """
         Check if the point is on land.
-        If polygon detection is enabled, checks polygons first, then falls back to raster.
         If a buffer is specified, check also the surrounding of the point.
         The check is done by sampling and checking points on a circle with
         the given buffer distance as radius in predefined angular steps.
@@ -359,26 +254,8 @@ class GcrSliderAlgorithm(RoutingAlg):
         :return:
         :rtype: bool
         """
-        # If polygon detection is enabled, check polygon first for center point
-        # If polygon detection is enabled, check polygon first for center point
-        if self.use_polygon_detection and self.land_polygon_detector is not None:
-            print(f"is_land: Using polygon detection for ({lat:.4f}, {lon:.4f})")
-            try:
-                from shapely.geometry import Point
-                point = Point(lon, lat)
-                intersections = self.land_polygon_detector.land_polygon_STRTree.query(point, predicate="intersects")
-                is_on_land = len(intersections) > 0
-                print(f"is_land: Point ({lat:.4f}, {lon:.4f}) result: {is_on_land} (polygon, {len(intersections)} intersections)")
-                if is_on_land:
-                    return True
-            except Exception as e:
-                print(f"is_land: Polygon check failed: {e}. Using raster.")
-        
-        # Fallback to raster-based check (original method)
         # Check center point
-        raster_result = is_land_global_land_mask(lat, lon)
-        if raster_result:
-            print(f"is_land: Point ({lat:.4f}, {lon:.4f}) IS LAND (raster)")
+        if is_land_global_land_mask(lat, lon):
             return True
         
         # Check buffer zone by sampling points on circle
@@ -437,7 +314,6 @@ class GcrSliderAlgorithm(RoutingAlg):
         """
         logger.info(f"Check segment from {start} to {end}.")
         line = geod.InverseLine(start[0], start[1], end[0], end[1])
-        print(f"[GCRSLIDER] split_segments called: {start} -> {end}")
         if self.has_point_on_land(line):
             logger.info("Segment crosses land. Split segment at midpoint.")
             if line.s13 > self.threshold:
