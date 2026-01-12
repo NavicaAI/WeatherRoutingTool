@@ -118,8 +118,9 @@ class Config(BaseModel):
 
     # options for isobased algorithms
     ISOCHRONE_MAX_ROUTING_STEPS: int = 100  # maximum number of routing steps
-    ISOCHRONE_MINIMISATION_CRITERION: Literal['dist', 'squareddist_over_disttodest', 'progress'] = 'squareddist_over_disttodest'
-    # options: 'dist', 'squareddist_over_disttodest', 'progress' (progress is best for calm weather)
+    ISOCHRONE_MINIMISATION_CRITERION: Literal['dist', 'squareddist_over_disttodest', 'progress', 'directional_progress'] = 'squareddist_over_disttodest'
+    # options: 'dist', 'squareddist_over_disttodest', 'progress', 'directional_progress' 
+    # directional_progress is best - rewards progress toward destination weighted by heading alignment
     ISOCHRONE_NUMBER_OF_ROUTES: int = 1  # integer specifying how many routes should be searched
     ISOCHRONE_PRUNE_GROUPS: Literal[
         'courses', 'larger_direction', 'branch', 'multiple_routes'] = 'larger_direction'

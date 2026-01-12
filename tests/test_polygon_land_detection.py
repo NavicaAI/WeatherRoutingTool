@@ -16,6 +16,7 @@ import os
 import sys
 import logging
 import numpy as np
+import pytest
 
 # Set up logging
 logging.basicConfig(
@@ -23,6 +24,22 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+@pytest.fixture
+def detector():
+    """Pytest fixture to create a detector for test_land_detection."""
+    from WeatherRoutingTool.constraints.constraints import LandPolygonsCrossing
+    from WeatherRoutingTool.utils.maps import Map
+    
+    # Corsica bounding box
+    map_size = Map(41.0, 8.0, 43.5, 10.0)
+    det = LandPolygonsCrossing(map_size=map_size)
+    
+    if not det.initialization_successful:
+        pytest.skip("Polygon detector not available (no database connection)")
+    
+    return det
 
 def check_environment():
     """Check if required environment variables are set."""
