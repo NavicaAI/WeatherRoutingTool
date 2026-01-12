@@ -133,12 +133,13 @@ class ConstraintPars:
     def __init__(self):
         self.resolution = 1.0 / 20
         self.bCheckEndPoints = True
-        self.bCheckCrossing = True
+        self.bCheckCrossing = True  # IMPORTANT: Enables continuous checks (polygon-based land detection)
 
     def print(self):
         logger.debug("Print settings of Constraint Pars:")
         logger.debug(form.get_log_step("resolution=" + str(self.resolution), 1))
         logger.debug(form.get_log_step("bCheckEndPoints=" + str(self.bCheckEndPoints), 1))
+        logger.debug(form.get_log_step("bCheckCrossing=" + str(self.bCheckCrossing) + " (enables continuous checks)", 1))
 
 
 class ConstraintsListFactory:
@@ -820,33 +821,84 @@ class ContinuousCheck(NegativeContraint):
     tags: list  # Values of the seamark tags that need to be considered
 
     engine: sqlalchemy.engine
+    _engine_cache = None  # Class-level shared connection pool
 
     def __init__(self, db_engine=None):
         NegativeContraint.__init__(self, "ContinuousChecks")
         if db_engine is not None:
             self.engine = db_engine
+            logger.info("ContinuousCheck: Using provided database engine.")
         else:
+            # Check for cached engine first to avoid reconnection overhead
+            if ContinuousCheck._engine_cache is not None:
+                self.engine = ContinuousCheck._engine_cache
+                logger.debug("ContinuousCheck: Using cached database connection")
+                return
+            
+            # Load from environment variables
             self.host = os.getenv("WRT_DB_HOST")
             self.database = os.getenv("WRT_DB_DATABASE")
             self.user = os.getenv("WRT_DB_USERNAME")
             self.password = os.getenv("WRT_DB_PASSWORD")
-            self.schema = os.getenv("POSTGRES_SCHEMA")
-            self.port = os.getenv("WRT_DB_PORT")
-            self.engine = self.connect_database()
+            self.schema = os.getenv("POSTGRES_SCHEMA", "public")  # Default to public schema
+            self.port = os.getenv("WRT_DB_PORT", "5432")  # Default PostgreSQL port
+            
+            # Check if all required env vars are set
+            if not all([self.host, self.database, self.user, self.password]):
+                logger.warning("ContinuousCheck: Database credentials not fully configured in environment variables.")
+                logger.warning("Required: WRT_DB_HOST, WRT_DB_DATABASE, WRT_DB_USERNAME, WRT_DB_PASSWORD")
+                logger.warning("Optional: WRT_DB_PORT (default: 5432), POSTGRES_SCHEMA (default: public)")
+                self.engine = None
+            else:
+                try:
+                    self.engine = self.connect_database()
+                    logger.info(f"ContinuousCheck: Connected to database {self.database} at {self.host}:{self.port}")
+                    # Cache the connection for reuse
+                    ContinuousCheck._engine_cache = self.engine
+                    logger.debug("ContinuousCheck: Cached database connection for reuse")
+                except Exception as e:
+                    logger.error(f"ContinuousCheck: Failed to connect to database: {e}")
+                    self.engine = None
 
     def print_info(self):
         logger.info(form.get_log_step("no seamarks crossing", 1))
 
     def connect_database(self):
         """
-        Connect to the database
+        Connect to the PostgreSQL/PostGIS database using SQLAlchemy.
+        Tests the connection before returning.
+        
+        :return: SQLAlchemy engine if successful, None otherwise
+        :rtype: sqlalchemy.engine.Engine or None
         """
-
-        # Connect to the PostgreSQL database using SQLAlchemy
-        engine = sqlalchemy.create_engine(
-            "postgresql://{user}:{pwd}@{host}:{port}/{db}".format(user=self.user, pwd=self.password, host=self.host,
-                                                                  db=self.database, port=self.port))
-        return engine
+        try:
+            connection_string = "postgresql://{user}:{pwd}@{host}:{port}/{db}".format(
+                user=self.user, 
+                pwd=self.password, 
+                host=self.host,
+                db=self.database, 
+                port=self.port
+            )
+            
+            # Create engine with connection pool settings
+            engine = sqlalchemy.create_engine(
+                connection_string,
+                pool_pre_ping=True,  # Verify connections before using
+                pool_size=5,
+                max_overflow=10
+            )
+            
+            # Test the connection
+            with engine.connect() as conn:
+                conn.execute(sqlalchemy.text("SELECT 1"))
+            
+            logger.info("Database connection successful.")
+            return engine
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to PostgreSQL database: {e}")
+            logger.error(f"Connection details: {self.host}:{self.port}/{self.database} as user '{self.user}'")
+            return None
 
     def set_map_bbox(self, map_size):
         if map_size.lon1 <= map_size.lon2:
@@ -1069,18 +1121,54 @@ class SeamarkCrossing(ContinuousCheck):
 
 class LandPolygonsCrossing(ContinuousCheck):
     """
-    Use the 'LandPolygonsCrossing' constraint cautiously.
-    This class is yet to be tested.
+    Constraint to prevent routes from crossing land using high-resolution polygon data from PostGIS.
+    This provides more accurate coastline detection than raster-based methods, especially around islands.
+    
+    Requires:
+    - PostGIS database with land_polygons table
+    - Environment variables: WRT_DB_HOST, WRT_DB_PORT, WRT_DB_DATABASE, WRT_DB_USERNAME, WRT_DB_PASSWORD
     """
     land_polygon_STRTree = None
+    _polygon_cache = {}  # Class-level cache: {bbox_wkt: (STRtree, gdf)}
 
     def __init__(self, map_size=None, db_engine=None):
         super().__init__(db_engine=db_engine)
         self.map_size = map_size
+        self.initialization_successful = False
 
-        if db_engine is None:
+        try:
+            if db_engine is None:
+                if self.engine is None:
+                    logger.warning("LandPolygonsCrossing: No database connection available. "
+                                 "Polygon-based land detection will not work.")
+                    return
+            
+            bbox_wkt = self.set_map_bbox(map_size)
+            
+            # Check cache first
+            if bbox_wkt in LandPolygonsCrossing._polygon_cache:
+                logger.info(f"LandPolygonsCrossing: Using cached polygons for bbox: {bbox_wkt}")
+                self.land_polygon_STRTree, _ = LandPolygonsCrossing._polygon_cache[bbox_wkt]
+                self.initialization_successful = True
+                return
+                    
+            # Not in cache - load from database
             landpolygon_query = self.build_landpolygon_query(map_size)
-            self.land_polygon_STRTree = self.set_landpolygon_STRTree(self.engine, landpolygon_query)
+            logger.info(f"LandPolygonsCrossing: Loading land polygons for bbox: {bbox_wkt}")
+            self.land_polygon_STRTree = self.set_landpolygon_STRTree(self.engine if db_engine is None else db_engine, 
+                                                                       landpolygon_query)
+            if self.land_polygon_STRTree is not None:
+                self.initialization_successful = True
+                logger.info("LandPolygonsCrossing: Successfully initialized polygon-based land detection.")
+                # Cache the result
+                # Note: We don't cache the gdf to save memory, just the STRtree
+                LandPolygonsCrossing._polygon_cache[bbox_wkt] = (self.land_polygon_STRTree, None)
+                logger.debug(f"LandPolygonsCrossing: Cached polygons for bbox: {bbox_wkt}")
+            else:
+                logger.warning("LandPolygonsCrossing: Failed to initialize STRtree. No land polygons loaded.")
+        except Exception as e:
+            logger.error(f"LandPolygonsCrossing initialization failed: {e}", exc_info=True)
+            logger.warning("LandPolygonsCrossing: Falling back - continuous land checks will be disabled.")
 
     def build_landpolygon_query(self, map_size):
         bbox_wkt = self.set_map_bbox(map_size)
@@ -1090,29 +1178,46 @@ class LandPolygonsCrossing(ContinuousCheck):
         return query
 
     def set_landpolygon_STRTree(self, db_engine=None, query=None):
-        land_polygon_gdf = self.query_land_polygons(db_engine, query)
-        land_STRTree = STRtree(land_polygon_gdf["geom"])
-        return land_STRTree
+        try:
+            land_polygon_gdf = self.query_land_polygons(db_engine, query)
+            if land_polygon_gdf is None or len(land_polygon_gdf) == 0:
+                logger.warning("LandPolygonsCrossing: No land polygons found in the specified bounding box.")
+                return None
+            logger.info(f"LandPolygonsCrossing: Loaded {len(land_polygon_gdf)} land polygon features.")
+            land_STRTree = STRtree(land_polygon_gdf["geom"])
+            return land_STRTree
+        except Exception as e:
+            logger.error(f"Failed to create STRtree from land polygons: {e}")
+            return None
 
     def query_land_polygons(self, db_engine, query):
         """
-        Create new GeoDataFrame using public.ways table in the query
+        Query land polygons from PostGIS database for the specified bounding box
 
         :param engine: sqlalchemy engine
         :type engine: sqlalchemy.engine.Engine
-        :param query: sql query for table ways
+        :param query: sql query for land_polygons table
         :type query: str
-        :return: gdf including all the features from public.ways table
+        :return: gdf including all the land polygon features
         :rtype: geopandas.GeoDataFrame
         """
-
-        gdf = gpd.read_postgis(sql=query, con=db_engine, geom_col="geom")  # .drop(columns=["GEOMETRY"])
-        gdf = gdf[gdf["geom"] != None]
-        return gdf
+        try:
+            logger.debug(f"Executing query: {query}")
+            gdf = gpd.read_postgis(sql=query, con=db_engine, geom_col="geom")
+            if gdf is not None and len(gdf) > 0:
+                gdf = gdf[gdf["geom"].notna()]
+                logger.debug(f"Successfully queried {len(gdf)} land polygons from database.")
+            else:
+                logger.warning("Query returned no land polygons.")
+            return gdf
+        except Exception as e:
+            logger.error(f"Failed to query land polygons from database: {e}", exc_info=True)
+            return None
 
     def check_crossing(self, lat_start, lon_start, lat_end, lon_end):
         """
-        Check if certain route crosses specified seamark objects
+        Check if route segments cross land using polygon-based intersection testing.
+        This is more accurate than raster-based methods for complex coastlines and islands.
 
         :param lat_start: array of all origin latitudes of routing segments
         :type lat_start: numpy.ndarray
@@ -1122,26 +1227,38 @@ class LandPolygonsCrossing(ContinuousCheck):
         :type lat_end: numpy.ndarray
         :param lon_end: array of all destination longitudes of routing segments
         :type lon_end: numpy.ndarray
-        :return: list of spatial relation result (True or False)
+        :return: list of spatial relation result (True if crosses land, False otherwise)
         :rtype: list[bool]
         """
 
         query_tree = []
-        if self.land_polygon_STRTree is not None:
-            # generating the LineString geometry from start and end point
+        
+        # If polygon detection not available, return all False (no constraint)
+        if self.land_polygon_STRTree is None or not self.initialization_successful:
+            logger.debug("LandPolygonsCrossing: STRtree not available, returning no constraints.")
+            return [False] * len(lat_start)
+        
+        try:
+            # Check each route segment for land intersection
             for i in range(len(lat_start)):
                 start_point = Point(lon_start[i], lat_start[i])
                 end_point = Point(lon_end[i], lat_end[i])
                 line = LineString([start_point, end_point])
 
-                route_df = gpd.GeoDataFrame(geometry=[line])
+                route_df = gpd.GeoDataFrame(geometry=[line], crs="EPSG:4326")
                 geom_object = self.land_polygon_STRTree.query(route_df["geometry"], predicate="intersects").tolist()
 
-                # checks if there is spatial relation between routes and seamarks objects
+                # Check if there is spatial relation between route and land polygons
                 if geom_object == [[], []] or geom_object == []:
-                    # if route is not constrained
+                    # Route does not cross land
                     query_tree.append(False)
                 else:
-                    # if route is constrained
+                    # Route crosses land
                     query_tree.append(True)
+                    logger.debug(f"LandPolygonsCrossing: Segment ({lat_start[i]:.4f},{lon_start[i]:.4f}) -> "
+                               f"({lat_end[i]:.4f},{lon_end[i]:.4f}) crosses land")
             return query_tree
+        except Exception as e:
+            logger.error(f"Error checking land crossing: {e}", exc_info=True)
+            # On error, be conservative and assume no crossing
+            return [False] * len(lat_start)

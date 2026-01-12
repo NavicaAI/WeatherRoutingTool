@@ -1,0 +1,92 @@
+{
+  "ALGORITHM_TYPE": "isofuel",
+  "BOAT_TYPE": "direct_power_method",
+  "CONSTRAINTS_LIST": [
+    "land_crossing_global_land_mask",
+    "land_crossing_polygons",
+    "on_map"
+  ],
+  "_comment_constraints": "Using both raster (global_land_mask) and polygon-based land detection for maximum accuracy",
+  
+  "DEFAULT_ROUTE": [41.5, 8.5, 42.5, 9.5],
+  "_comment_route": "Route around Corsica - adjust as needed for your specific test case",
+  
+  "DEFAULT_MAP": [41.0, 8.0, 43.5, 10.0],
+  "_comment_map": "Bounding box covering Corsica and surrounding waters",
+  
+  "DELTA_FUEL": 3000,
+  "DELTA_TIME_FORECAST": 3,
+  "DEPARTURE_TIME": "2026-01-15T00:00Z",
+  
+  "DIJKSTRA_MASK_FILE": null,
+  "DIJKSTRA_NOF_NEIGHBORS": 1,
+  "DIJKSTRA_STEP": 1,
+  
+  "GCR_SLIDER_ANGLE_STEP": 30,
+  "GCR_SLIDER_DISTANCE_MOVE": 10000,
+  "GCR_SLIDER_DYNAMIC_PARAMETERS": true,
+  "GCR_SLIDER_LAND_BUFFER": 1000,
+  "GCR_SLIDER_INTERPOLATE": true,
+  "GCR_SLIDER_INTERP_DIST": 0.1,
+  "GCR_SLIDER_INTERP_NORMALIZED": true,
+  "GCR_SLIDER_MAX_POINTS": 300,
+  "GCR_SLIDER_THRESHOLD": 10000,
+  "GCR_SLIDER_USE_POLYGON_LAND_DETECTION": true,
+  "_comment_gcr": "Polygon detection enabled for GCR Slider algorithm",
+  
+  "GENETIC_NUMBER_GENERATIONS": 20,
+  "GENETIC_NUMBER_OFFSPRINGS": 2,
+  "GENETIC_POPULATION_SIZE": 20,
+  "GENETIC_POPULATION_TYPE": "grid_based",
+  "GENETIC_POPULATION_PATH": null,
+  "GENETIC_REPAIR_TYPE": ["waypoints_infill", "constraint_violation"],
+  "GENETIC_CROSSOVER_TYPE": "two_point",
+  "GENETIC_MUTATION_TYPE": "random_waypoint_shift",
+  "GENETIC_MUTATION_PROBABILITY": 0.3,
+  "GENETIC_WAYPOINT_SHIFT_DISTANCE": 50000,
+  "GENETIC_FIX_RANDOM_SEED": false,
+  
+  "ISOCHRONE_MINIMIZE": "fuel",
+  "ISOCHRONE_MAX_ROUTING_STEPS": 30,
+  "ISOCHRONE_PRUNE_SEGMENTS": true,
+  "ISOCHRONE_PRUNE_SYMMETRY_AXIS": false,
+  "ISOCHRONE_PRUNE_GROUPS": "branch",
+  
+  "ROUTER_HDGS_INCREMENTS_DEG": 10,
+  "ROUTER_HDGS_SEGMENTS": 18,
+  "_comment_router": "18 segments * 10° = 180° coverage for route planning",
+  
+  "SAVE_ROUTE": true,
+  "SAVE_GPKG": false,
+  "SAVE_JSON": true,
+  "SAVE_GEOJSON": true,
+  
+  "SHIP_COURSE": 0,
+  "SHIP_SPEED": 10,
+  "SHIP_DRAUGHT": 5.0,
+  "_comment_ship": "Adjust ship parameters as needed for your vessel",
+  
+  "TIME_FORECAST": 168,
+  "TIME_OFFSET": 0,
+  
+  "USE_CURRENTS": true,
+  "USE_WAVES": true,
+  "USE_WIND": true,
+  
+  "VERBOSE": true,
+  "DEBUG": false,
+  
+  "WAYPOINTS": [],
+  "_comment_waypoints": "Add intermediate waypoints here if needed, format: [[lat1, lon1], [lat2, lon2]]",
+  
+  "WEATHER_DATA": null,
+  "WEATHER_DATA_TIME_RANGE": null,
+  
+  "_notes": [
+    "This configuration is optimized for testing around Corsica with polygon-based land detection",
+    "Requires PostGIS database with land_polygons table populated",
+    "Set environment variables: WRT_DB_HOST, WRT_DB_PORT, WRT_DB_DATABASE, WRT_DB_USERNAME, WRT_DB_PASSWORD",
+    "The CONSTRAINTS_LIST includes both land_crossing_global_land_mask (raster) and land_crossing_polygons (vector)",
+    "This dual approach provides: fast raster checks for endpoints, accurate polygon checks for line segments"
+  ]
+}

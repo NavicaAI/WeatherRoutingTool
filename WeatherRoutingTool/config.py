@@ -4,7 +4,13 @@ import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path, PosixPath
-from typing import Annotated, List, Literal, Optional, Self, Union
+from typing import Annotated, List, Literal, Optional, Union
+
+# For Python 3.10 compatibility
+try:
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 import pandas as pd
 import xarray as xr
@@ -104,6 +110,7 @@ class Config(BaseModel):
     ] = 'random'
     GENETIC_CROSSOVER_PATCHER: Literal['gcr', 'isofuel'] = 'isofuel'
     GENETIC_FIX_RANDOM_SEED: bool = False
+    GENETIC_SAVE_HISTORY: bool = False  # Set to True to enable history for plotting (can cause pickle errors)
 
     INTERMEDIATE_WAYPOINTS: Annotated[
         list[Annotated[list[Union[int, float]], Field(min_length=2, max_length=2)]],
@@ -111,8 +118,8 @@ class Config(BaseModel):
 
     # options for isobased algorithms
     ISOCHRONE_MAX_ROUTING_STEPS: int = 100  # maximum number of routing steps
-    ISOCHRONE_MINIMISATION_CRITERION: Literal['dist', 'squareddist_over_disttodest'] = 'squareddist_over_disttodest'
-    # options: 'dist', 'squareddist_over_disttodest'
+    ISOCHRONE_MINIMISATION_CRITERION: Literal['dist', 'squareddist_over_disttodest', 'progress'] = 'squareddist_over_disttodest'
+    # options: 'dist', 'squareddist_over_disttodest', 'progress' (progress is best for calm weather)
     ISOCHRONE_NUMBER_OF_ROUTES: int = 1  # integer specifying how many routes should be searched
     ISOCHRONE_PRUNE_GROUPS: Literal[
         'courses', 'larger_direction', 'branch', 'multiple_routes'] = 'larger_direction'

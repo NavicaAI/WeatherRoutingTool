@@ -779,7 +779,8 @@ class IsoBased(RoutingAlg):
         constraints_list.reached_positive()
         self.finish_temp = constraints_list.get_current_destination()
         self.start_temp = constraints_list.get_current_start()
-        self.gcr_course_temp = self.calculate_gcr(self.start_temp, self.finish_temp) * u.degree
+        # calculate_gcr returns (azimuth, distance) tuple - extract just the azimuth
+        self.gcr_course_temp = self.calculate_gcr(self.start_temp, self.finish_temp)[0] * u.degree
         self.status.update_state("routing")
 
         logger.info('Initiating routing for next segment going from ' + str(self.start_temp) + ' to ' + str(
@@ -1736,6 +1737,18 @@ class IsoBased(RoutingAlg):
                 self.full_dist_traveled = travel_dist['s12'] * travel_dist['s12'] / dist_to_dest['s12']
             if self.minimisation_criterion == 'dist':
                 self.full_dist_traveled = travel_dist['s12']
+            if self.minimisation_criterion == 'progress':
+                # Calculate actual progress toward destination
+                # initial_dist is distance from start to finish (current segment)
+                initial_dist = geod.inverse(start_lats, start_lons, end_lats, end_lons)['s12']
+                # Progress = how much closer we got to destination
+                # Positive means we're closer, negative means we went further away
+                progress = initial_dist - dist_to_dest['s12']
+                # Penalize routes that haven't made progress (went wrong direction)
+                progress[progress < 0] = 0  # Don't reward going backwards
+                # CRITICAL: Zero out constrained routes (crossing land, etc.)
+                progress[is_constrained] = 0
+                self.full_dist_traveled = progress
         else:
             self.full_dist_traveled = travel_dist['s12']
         # ToDo: use logger.debug and args.debug
@@ -1871,7 +1884,8 @@ class IsoBased(RoutingAlg):
         constraint_list.init_positive_lists(self.start, self.finish)
         self.finish_temp = constraint_list.get_current_destination()
         self.start_temp = constraint_list.get_current_start()
-        self.gcr_course_temp = self.calculate_gcr(self.start_temp, self.finish_temp) * u.degree
+        # calculate_gcr returns (azimuth, distance) tuple - extract just the azimuth
+        self.gcr_course_temp = self.calculate_gcr(self.start_temp, self.finish_temp)[0] * u.degree
 
         logger.info('Currently going from')
         logger.info(self.start_temp)
