@@ -387,7 +387,7 @@ class GcrSliderAlgorithm(RoutingAlg):
         # Check center point
         raster_result = is_land_global_land_mask(lat, lon)
         if raster_result:
-            print(f"is_land: Point ({lat:.4f}, {lon:.4f}) IS LAND (raster)")
+            logger.debug(f"is_land: Point ({lat:.4f}, {lon:.4f}) IS LAND (raster)")
             return True
         
         # Check buffer zone by sampling points on circle

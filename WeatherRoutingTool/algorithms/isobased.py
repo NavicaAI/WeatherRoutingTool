@@ -1749,31 +1749,6 @@ class IsoBased(RoutingAlg):
                 # CRITICAL: Zero out constrained routes (crossing land, etc.)
                 progress[is_constrained] = 0
                 self.full_dist_traveled = progress
-            if self.minimisation_criterion == 'directional_progress':
-                # Progress weighted by directional alignment with destination
-                # This prevents routes from "blooming" off-course
-                initial_dist = geod.inverse(start_lats, start_lons, end_lats, end_lons)['s12']
-                progress = initial_dist - dist_to_dest['s12']
-                progress[progress < 0] = 0
-                
-                # Calculate how aligned current heading is with destination
-                # Azimuth from current position to destination
-                bearing_to_dest = geod.inverse(end_step_lat, end_step_lon, end_lats, end_lons)['azi1']
-                # Azimuth from start to current position (our travel direction)
-                travel_bearing = geod.inverse(start_lats, start_lons, end_step_lat, end_step_lon)['azi1']
-                
-                # Angular difference (0-180 degrees)
-                angle_diff = np.abs(bearing_to_dest - travel_bearing)
-                angle_diff = np.minimum(angle_diff, 360 - angle_diff)  # Handle wraparound
-                
-                # Weight: cos(angle_diff) ranges from 1 (aligned) to -1 (opposite)
-                # Routes going wrong direction get heavily penalized
-                direction_weight = np.cos(np.radians(angle_diff))
-                direction_weight = np.maximum(direction_weight, 0)  # Only reward forward progress
-                
-                weighted_progress = progress * direction_weight
-                weighted_progress[is_constrained] = 0
-                self.full_dist_traveled = weighted_progress
         else:
             self.full_dist_traveled = travel_dist['s12']
         # ToDo: use logger.debug and args.debug

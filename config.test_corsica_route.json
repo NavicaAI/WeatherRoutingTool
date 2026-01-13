@@ -1,4 +1,7 @@
 {
+  "_example_description": "Example configuration for testing GCR Slider algorithm with polygon-based land detection. Route crosses Corsica to verify land avoidance works correctly.",
+  "_example_requirements": "Requires PostGIS database with land_polygons table. Set WRT_DB_* environment variables. Create dummy weather/depth files or provide real data.",
+  
   "DEFAULT_ROUTE": [42.0, 8.0, 42.2, 9.8],
   "DEPARTURE_TIME": "2023-11-11T11:11Z",
   "DEFAULT_MAP": [41.0, 7.0, 43.5, 11.0],

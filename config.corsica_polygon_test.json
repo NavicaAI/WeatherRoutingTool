@@ -1,4 +1,7 @@
 {
+  "_example_description": "Example configuration for testing polygon-based land detection around Corsica/Sardinia. Demonstrates hybrid raster+polygon constraint setup. Copy and modify for your own routes.",
+  "_example_requirements": "Requires PostGIS database with land_polygons table. Set WRT_DB_* environment variables.",
+  
   "ALGORITHM_TYPE": "isofuel",
   "BOAT_TYPE": "direct_power_method",
   "CONSTRAINTS_LIST": [
