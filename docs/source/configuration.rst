@@ -153,15 +153,15 @@ Credentials for the Copernicus Marine Environment Monitoring Service (CMEMS) to 
 
 If not provided ``DATA_MODE='automatic'`` cannot be used.
 
-Configuration parameters for the database which stores OpenSeaMap data (optional):
+Configuration parameters for the database which stores OpenSeaMap data and land polygon data (optional):
 
-- ``WRT_DB_HOST``
-- ``WRT_DB_PORT``
-- ``WRT_DB_DATABASE``
-- ``WRT_DB_USERNAME``
-- ``WRT_DB_PASSWORD``
+- ``WRT_DB_HOST``: database hostname (e.g. ``localhost``)
+- ``WRT_DB_PORT``: database port (e.g. ``5432`` or ``5433``)
+- ``WRT_DB_DATABASE``: database name (e.g. ``gis_db``)
+- ``WRT_DB_USERNAME``: database user
+- ``WRT_DB_PASSWORD``: database password
 
-If not provided the 'land_crossing_polygons' and 'seamarks' options of ``CONSTRAINTS_LIST`` and ``ROUTE_POSTPROCESSING=True`` cannot be used.
+If not provided the ``land_crossing_polygons`` and ``seamarks`` options of ``CONSTRAINTS_LIST`` and ``ROUTE_POSTPROCESSING=True`` cannot be used. The system will gracefully fall back to raster-based land detection if the database is unavailable.
 
 Path for storing figures (mainly for debugging purposes):
 

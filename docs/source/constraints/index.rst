@@ -64,6 +64,52 @@ The primary TSS rules have been addressed in the current development phase are:
 
 Furthermore, if the starting node or the ending node is located inside a traffic separation zone, route postprocessing is not further executed.
 
+Land Crossing Detection
+-----------------------
+
+The WRT provides two methods for detecting land crossings, which can be used individually or in combination:
+
+**Raster-based detection** (``land_crossing_global_land_mask``):
+
+Uses the `global-land-mask <https://github.com/toddkarin/global-land-mask>`_ library which provides a raster grid at approximately 1.8 km resolution. This method is fast and requires no external dependencies, but may miss narrow passages or produce false positives near complex coastlines.
+
+**Polygon-based detection** (``land_crossing_polygons``):
+
+Uses high-resolution vector coastline data stored in a PostGIS database. This method performs line segment intersection tests against land polygons, providing accurate detection even for complex geometries such as islands, narrow straits, and fjords.
+
+The recommended approach is to use both constraints together:
+
+.. code-block:: json
+
+   {
+     "CONSTRAINTS_LIST": [
+       "land_crossing_global_land_mask",
+       "land_crossing_polygons"
+     ]
+   }
+
+This hybrid approach uses the raster method for initial fast filtering and the polygon method for accurate validation of segments near coastlines.
+
+**Database requirements for polygon detection:**
+
+The polygon-based method requires a PostGIS database with a ``land_polygons`` table containing coastline geometry data. The expected schema is:
+
+.. code-block:: sql
+
+   CREATE TABLE public.land_polygons (
+       gid SERIAL PRIMARY KEY,
+       wkb_geometry GEOMETRY(MULTIPOLYGON, 4326)
+   );
+   CREATE INDEX ON land_polygons USING GIST (wkb_geometry);
+
+Recommended data sources:
+
+* `OpenStreetMap Land Polygons <https://osmdata.openstreetmap.de/data/land-polygons.html>`_ (recommended, updated weekly)
+* `Natural Earth 1:10m <https://www.naturalearthdata.com/downloads/10m-physical-vectors/>`_
+* `GSHHG high-resolution <https://www.soest.hawaii.edu/pwessel/gshhg/>`_
+
+The database connection is configured via environment variables (see :ref:`configuration`). If the database is unavailable, the system gracefully falls back to raster-only detection.
+
 Useful links:
 -------------
 
