@@ -59,7 +59,7 @@ class Config(BaseModel):
     # (via the ValidationInfo object) which have been declared earlier.
 
     # Other configuration
-    ALGORITHM_TYPE: Literal['dijkstra', 'gcr_slider', 'genetic', 'genetic_shortest_route', 'isofuel',
+    ALGORITHM_TYPE: Literal['astar', 'dijkstra', 'gcr_slider', 'genetic', 'genetic_shortest_route', 'greedy', 'isofuel',
                             'speedy_isobased'] = 'isofuel'
 
     BOAT_TYPE: Literal['CBT', 'SAL', 'speedy_isobased', 'direct_power_method'] = 'direct_power_method'  # options: 'CBT', 'SAL','speedy_isobased', 'direct_power_method  # noqa: E501
@@ -83,6 +83,17 @@ class Config(BaseModel):
     # or downloaded via https://github.com/toddkarin/global-land-mask/blob/master/global_land_mask/globe_combined_mask_compressed.npz  # noqa: E501
     DIJKSTRA_NOF_NEIGHBORS: int = 1  # number of neighbors to use when creating a graph from the grid
     DIJKSTRA_STEP: int = 1  # step used to save final route to prevent very dense waypoints
+    DIJKSTRA_USE_WEATHER: bool = False  # whether to use weather data for fuel-cost edge weights
+
+    # options for A* algorithm
+    ASTAR_GRID_RESOLUTION: float = 0.05  # Grid resolution in degrees (~5km at 0.05)
+    ASTAR_NOF_NEIGHBORS: int = 1  # Number of neighbor rings (1=8 neighbors, 2=24 neighbors)
+    ASTAR_LAND_CHECK_INTERVAL: int = 1000  # Interval in meters for land crossing checks
+    ASTAR_USE_WEATHER: bool = True  # Whether to use weather for edge costs
+    ASTAR_LAT_MIN: float = None  # Region bounds (None = use map bounds)
+    ASTAR_LAT_MAX: float = None
+    ASTAR_LON_MIN: float = None
+    ASTAR_LON_MAX: float = None
 
     # options for GCR Slider algorithm
     GCR_SLIDER_ANGLE_STEP: float = 30  # in degrees
@@ -111,6 +122,14 @@ class Config(BaseModel):
     GENETIC_CROSSOVER_PATCHER: Literal['gcr', 'isofuel'] = 'isofuel'
     GENETIC_FIX_RANDOM_SEED: bool = False
     GENETIC_SAVE_HISTORY: bool = False  # Set to True to enable history for plotting (can cause pickle errors)
+
+    # Options for Greedy algorithm
+    # Simple, intuitive routing that always picks direction with most progress toward destination
+    GREEDY_DELTA_FUEL_KG: float = 1000.0  # Fuel budget per step (kg) - smaller = higher resolution
+    GREEDY_HEADING_SAMPLES: int = 72  # Number of directions to sample (72 = every 5 degrees)
+    GREEDY_MAX_ITERATIONS: int = 500  # Safety limit to prevent infinite loops
+    GREEDY_ARRIVAL_THRESHOLD_M: float = 5000.0  # Consider arrived when within this distance (meters)
+    GREEDY_USE_WEATHER: bool = True  # Whether to use weather data for speed/fuel calculations
 
     INTERMEDIATE_WAYPOINTS: Annotated[
         list[Annotated[list[Union[int, float]], Field(min_length=2, max_length=2)]],

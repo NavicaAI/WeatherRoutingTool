@@ -1206,7 +1206,9 @@ class IsoBased(RoutingAlg):
         if trim:
             for i in range(len(bin_edges) - 1):
                 try:
-                    if (bin_stat[i] == 0):
+                    # Skip bins where best route has zero or negative progress
+                    # Negative progress indicates constraint violations (e.g., land crossing)
+                    if (bin_stat[i] <= 0):
                         continue
                     idxs.append(np.where(self.full_dist_traveled == bin_stat[i])[0][0])
                 except IndexError:
@@ -1398,7 +1400,9 @@ class IsoBased(RoutingAlg):
             specific_route_group = df_grouped_by_routes_has_same_origin.get_group(unique_key)
 
             max_dist = specific_route_group['dist'].max()
-            if max_dist == 0.:
+            # Skip branches where best route has zero or negative progress
+            # Negative progress indicates constraint violations (e.g., land crossing)
+            if max_dist <= 0.:
                 continue
 
             max_dist_indxs = specific_route_group[specific_route_group['dist'] == max_dist]['st_index']
@@ -1744,10 +1748,16 @@ class IsoBased(RoutingAlg):
                 # Progress = how much closer we got to destination
                 # Positive means we're closer, negative means we went further away
                 progress = initial_dist - dist_to_dest['s12']
-                # Penalize routes that haven't made progress (went wrong direction)
-                progress[progress < 0] = 0  # Don't reward going backwards
-                # CRITICAL: Zero out constrained routes (crossing land, etc.)
-                progress[is_constrained] = 0
+                
+                # CRITICAL: Heavily penalize constrained routes (crossing land, etc.)
+                # Use a large negative value so they're never selected in pruning
+                # -1e9 is large enough to ensure these routes are always rejected
+                progress[is_constrained] = -1e9
+                
+                # Also penalize routes going backward (but less severely)
+                # They get zero progress, but constrained routes get negative
+                progress[(progress < 0) & ~np.array(is_constrained)] = 0
+                
                 self.full_dist_traveled = progress
         else:
             self.full_dist_traveled = travel_dist['s12']

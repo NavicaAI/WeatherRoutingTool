@@ -58,6 +58,8 @@ WEATHER_CACHE_TTL_SECONDS = int(os.environ.get('WEATHER_CACHE_TTL_SECONDS', '360
 # FROZEN TIME MODE: Reuse cached weather data indefinitely for rapid iteration
 FROZEN_TIME_MODE = os.environ.get('FROZEN_TIME_MODE', 'true').lower() == 'true'
 FROZEN_TIME_KEY = os.environ.get('FROZEN_TIME_KEY', 'sardinia_2026_01')
+# Default departure time in frozen mode - must be within the cached weather data range
+FROZEN_DEPARTURE_TIME = os.environ.get('FROZEN_DEPARTURE_TIME', '2026-01-15T08:00:00Z')
 
 # PostGIS config for land polygon detection
 os.environ.setdefault('WRT_DB_HOST', 'localhost')
@@ -68,6 +70,10 @@ os.environ.setdefault('WRT_DB_PASSWORD', 'postgis_password')
 
 # Thread pool for CPU-bound operations
 executor = ThreadPoolExecutor(max_workers=2)
+
+# Lock for netCDF operations (netCDF4 library is not thread-safe)
+import threading
+netcdf_lock = threading.Lock()
 
 # Ensure directories exist
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
@@ -163,8 +169,15 @@ def fetch_marine_grid(
     resolution: float = 1.0,  # Increased from 0.5 for faster fetching
     forecast_days: int = 3    # Reduced from 7 for faster fetching
 ) -> xr.Dataset:
-    lats = np.arange(lat_min, lat_max + resolution, resolution)
-    lons = np.arange(lon_min, lon_max + resolution, resolution)
+    # Snap bounds to whole degrees for better cache hits across different routes
+    # This ensures nearby routes use the same grid points and share cached data
+    lat_min_snapped = np.floor(lat_min)
+    lat_max_snapped = np.ceil(lat_max)
+    lon_min_snapped = np.floor(lon_min)
+    lon_max_snapped = np.ceil(lon_max)
+    
+    lats = np.arange(lat_min_snapped, lat_max_snapped + resolution, resolution)
+    lons = np.arange(lon_min_snapped, lon_max_snapped + resolution, resolution)
     
     print(f"[Weather] Grid: {len(lats)} x {len(lons)} = {len(lats) * len(lons)} points", flush=True)
     
@@ -375,7 +388,12 @@ def create_synthetic_weather(
     n_times = time_hours  # Use provided time range
     
     # Use numpy datetime64 for netCDF compatibility
-    base_time = np.datetime64(datetime.now(timezone.utc).replace(tzinfo=None))
+    # In FROZEN_TIME_MODE, use FROZEN_DEPARTURE_TIME as base to ensure time coverage
+    if FROZEN_TIME_MODE:
+        frozen_dt = datetime.fromisoformat(FROZEN_DEPARTURE_TIME.replace('Z', '+00:00')).replace(tzinfo=None)
+        base_time = np.datetime64(frozen_dt)
+    else:
+        base_time = np.datetime64(datetime.now(timezone.utc).replace(tzinfo=None))
     times = np.array([base_time + np.timedelta64(h, 'h') for h in range(n_times)])
     
     # Calm conditions - minimal wind and waves
@@ -494,7 +512,8 @@ def create_synthetic_depth(
     ds.attrs['source'] = 'NavicaAI local dev server'
     ds.attrs['created'] = datetime.now(timezone.utc).isoformat()
     
-    ds.to_netcdf(output_path)
+    with netcdf_lock:
+        ds.to_netcdf(output_path)
     print(f"[Depth] Created: {output_path} ({n_lats}x{n_lons} grid)", flush=True)
     return output_path
 
@@ -524,7 +543,7 @@ class RouteRequest(BaseModel):
     departure_time: Optional[str] = None
     vessel: Optional[VesselConfig] = None
     weather_optimization: bool = True  # If True, runs two passes: calm baseline + real weather optimized
-    algorithm: Optional[str] = "isofuel"  # Options: "isofuel", "genetic", "gcrslider"
+    algorithm: Optional[str] = None  # Options: "astar" (default), "isofuel", "genetic", "gcrslider", "greedy", "dijkstra"
     weather_source: Optional[str] = None  # Deprecated - now controlled by weather_optimization flag
     time_forecast_hours: Optional[int] = Field(default=None, description="Forecast window in hours. If not provided, uses 168 for calm weather or 144 for real weather. Tip: use calm route time estimate to size this.")
 
@@ -578,13 +597,21 @@ def calculate_route_distance(coords: List[List[float]]) -> float:
 
 
 def format_departure_time(iso_string: Optional[str]) -> str:
+    """Format departure time. In FROZEN_TIME_MODE, defaults to FROZEN_DEPARTURE_TIME."""
     if not iso_string:
-        dt = datetime.now(timezone.utc) + timedelta(hours=1)
+        if FROZEN_TIME_MODE:
+            # Use fixed departure time in frozen mode to match cached weather data
+            dt = datetime.fromisoformat(FROZEN_DEPARTURE_TIME.replace('Z', '+00:00'))
+        else:
+            dt = datetime.now(timezone.utc) + timedelta(hours=1)
     else:
         try:
             dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
         except:
-            dt = datetime.now(timezone.utc) + timedelta(hours=1)
+            if FROZEN_TIME_MODE:
+                dt = datetime.fromisoformat(FROZEN_DEPARTURE_TIME.replace('Z', '+00:00'))
+            else:
+                dt = datetime.now(timezone.utc) + timedelta(hours=1)
     return dt.strftime('%Y-%m-%dT%H:%MZ')
 
 
@@ -604,6 +631,71 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def validate_route_land_crossings(coords: list, map_size_tuple: tuple) -> dict:
+    """
+    Validate that a route doesn't cross land using PostGIS polygon data.
+    
+    Args:
+        coords: List of [lat, lon] coordinates
+        map_size_tuple: (lat_min, lon_min, lat_max, lon_max) for the route area
+    
+    Returns:
+        {"valid": True} or {"valid": False, "crossings": [...list of crossing segment indices...]}
+    """
+    try:
+        from WeatherRoutingTool.utils.maps import Map
+        from WeatherRoutingTool.constraints.constraints import LandPolygonsCrossing
+        from sqlalchemy import create_engine
+        import numpy as np
+        
+        # Create database connection
+        host = os.environ.get('WRT_DB_HOST', 'localhost')
+        port = os.environ.get('WRT_DB_PORT', '5433')
+        database = os.environ.get('WRT_DB_DATABASE', 'gis_db')
+        username = os.environ.get('WRT_DB_USERNAME', 'gis_user')
+        password = os.environ.get('WRT_DB_PASSWORD', 'postgis_password')
+        
+        connection_string = f"postgresql://{username}:{password}@{host}:{port}/{database}"
+        engine = create_engine(connection_string)
+        
+        # Create map and constraint checker
+        lat_min, lon_min, lat_max, lon_max = map_size_tuple
+        map_size = Map(lat1=lat_min, lon1=lon_min, lat2=lat_max, lon2=lon_max)
+        checker = LandPolygonsCrossing(map_size=map_size, db_engine=engine)
+        
+        if not checker.initialization_successful:
+            print("[Route Validation] Warning: Land polygon checker not available, skipping validation", flush=True)
+            return {"valid": True, "warning": "validation_unavailable"}
+        
+        # Check each segment
+        crossings = []
+        for i in range(len(coords) - 1):
+            lat1, lon1 = coords[i]
+            lat2, lon2 = coords[i + 1]
+            
+            result = checker.check_crossing(
+                np.array([lat1]), np.array([lon1]),
+                np.array([lat2]), np.array([lon2])
+            )
+            
+            if result and result[0]:
+                crossings.append({
+                    "segment": i,
+                    "from": [lat1, lon1],
+                    "to": [lat2, lon2]
+                })
+        
+        if crossings:
+            print(f"[Route Validation] WARNING: Route crosses land at {len(crossings)} segments: {[c['segment'] for c in crossings]}", flush=True)
+            return {"valid": False, "crossings": crossings}
+        
+        return {"valid": True}
+        
+    except Exception as e:
+        print(f"[Route Validation] Error during validation: {e}", flush=True)
+        return {"valid": True, "error": str(e)}
 
 
 def run_wrt_direct(config_dict: dict, output_dir: str) -> dict:
@@ -646,6 +738,28 @@ def run_wrt_direct(config_dict: dict, output_dir: str) -> dict:
                 
                 if coords:
                     print(f"[WRT] Found route with {len(coords)} points", flush=True)
+                    
+                    # Validate route doesn't cross land
+                    # Extract map bounds from config
+                    map_lat1 = config_dict.get('LAT_START', coords[0][0]) - 1
+                    map_lat2 = config_dict.get('LAT_FINISH', coords[-1][0]) + 1
+                    map_lon1 = config_dict.get('LON_START', coords[0][1]) - 1
+                    map_lon2 = config_dict.get('LON_FINISH', coords[-1][1]) + 1
+                    map_bounds = (min(map_lat1, map_lat2), min(map_lon1, map_lon2), 
+                                 max(map_lat1, map_lat2), max(map_lon1, map_lon2))
+                    
+                    validation = validate_route_land_crossings(coords, map_bounds)
+                    if not validation.get("valid", True):
+                        # Route crosses land - return error with details
+                        crossings = validation.get("crossings", [])
+                        crossing_info = [f"Segment {c['segment']}: {c['from']} -> {c['to']}" for c in crossings[:3]]
+                        return {
+                            "success": False, 
+                            "error": f"Route crosses land at {len(crossings)} segment(s): {'; '.join(crossing_info)}",
+                            "land_crossings": crossings,
+                            "coords": coords  # Include coords for debugging
+                        }
+                    
                     return {"success": True, "coords": coords}
             except Exception as e:
                 print(f"[WRT] Error parsing {route_file}: {e}", flush=True)
@@ -710,7 +824,8 @@ async def run_single_routing_pass(
             forecast_days = max(7, (time_forecast // 24) + 1)
             weather_ds = fetch_marine_grid(lat_min, lat_max, lon_min, lon_max, resolution=1.0, forecast_days=forecast_days)
             weather_path = f"{DATA_DIR}/weather_{pass_id}.nc"
-            weather_ds.to_netcdf(weather_path)
+            with netcdf_lock:
+                weather_ds.to_netcdf(weather_path)
             print(f"[Weather:{pass_id}] Saved real weather to: {weather_path}", flush=True)
         except Exception as e:
             return {"success": False, "error": f"Failed to fetch real weather: {str(e)}"}
@@ -772,6 +887,31 @@ async def run_single_routing_pass(
         "GCR_SLIDER_LAND_BUFFER": 1000,
         "GCR_SLIDER_THRESHOLD": 10000,
         "GCR_SLIDER_MAX_POINTS": 300,
+        
+        # Greedy algorithm settings
+        "GREEDY_DELTA_FUEL_KG": 500.0,       # Fuel per step (smaller = finer resolution)
+        "GREEDY_HEADING_SAMPLES": 72,        # Sample every 5 degrees (360/72)
+        "GREEDY_MAX_ITERATIONS": 1000,       # Safety limit
+        "GREEDY_ARRIVAL_THRESHOLD_M": 2000.0, # Arrival distance in meters
+        "GREEDY_USE_WEATHER": True,          # Use weather data if available
+        
+        # Dijkstra algorithm settings
+        "DIJKSTRA_MASK_FILE": "/home/insectile/Development/Navica/WeatherRoutingTool/.venv/lib/python3.10/site-packages/global_land_mask/globe_combined_mask_compressed.npz",
+        "DIJKSTRA_NOF_NEIGHBORS": 2,         # Connect to 2 neighbors in each direction for more route options
+        "DIJKSTRA_STEP": 1,                  # Keep all waypoints
+        "DIJKSTRA_USE_WEATHER": weather_source == "real",  # Use weather for fuel costs when available
+        
+        # A* algorithm settings - Full Western/Central Mediterranean at ~5km resolution
+        # Covers: Gibraltar to Albania, includes Malta, Corsica, Sardinia, Sicily
+        # Estimated: ~2.6M cells, ~35min initial build, ~2GB cache
+        "ASTAR_GRID_RESOLUTION": 0.05,       # ~5km resolution (0.05 degrees)
+        "ASTAR_NOF_NEIGHBORS": 1,            # 8 neighbors per node
+        "ASTAR_LAND_CHECK_INTERVAL": 1000,   # Check every 1km for land crossings
+        "ASTAR_USE_WEATHER": weather_source == "real",  # Use weather for edge costs
+        "ASTAR_LAT_MIN": 34.0,               # Full Med region bounds
+        "ASTAR_LAT_MAX": 45.0,
+        "ASTAR_LON_MIN": 4.0,
+        "ASTAR_LON_MAX": 21.0,
         
         "WEATHER_DATA": weather_path,
         "DEPTH_DATA": depth_path,
@@ -860,17 +1000,17 @@ async def calculate_route(request: RouteRequest):
     
     request_id = hashlib.md5(f"{request.start.lat}{request.start.lon}{request.end.lat}{request.end.lon}{time.time()}".encode()).hexdigest()[:8]
     
-    # Algorithm selection (default: isofuel)
-    algorithm = request.algorithm or "isofuel"
-    if algorithm not in ["isofuel", "genetic", "gcrslider"]:
+    # Algorithm selection (default: astar for reliable land avoidance + weather)
+    algorithm = request.algorithm or "astar"
+    if algorithm not in ["isofuel", "genetic", "gcrslider", "greedy", "dijkstra", "astar"]:
         return RouteResponse(
             success=False,
-            error=f"Unknown algorithm: {algorithm}. Options: isofuel, genetic, gcrslider",
+            error=f"Unknown algorithm: {algorithm}. Options: isofuel, genetic, gcrslider, greedy, dijkstra, astar",
             execution_time_ms=(time.time() - start_time) * 1000
         )
     
     # Validate waypoint support
-    algorithms_with_waypoint_support = ["isofuel"]
+    algorithms_with_waypoint_support = ["isofuel", "greedy", "astar"]
     if request.waypoints and algorithm not in algorithms_with_waypoint_support:
         from fastapi import HTTPException
         raise HTTPException(

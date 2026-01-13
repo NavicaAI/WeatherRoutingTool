@@ -1,0 +1,65 @@
+# Dockerfile.server - FastAPI wrapper for WeatherRoutingTool
+# Build: docker build -f Dockerfile.server -t navicaai/weather-routing-tool .
+# Run: docker run -p 8001:8000 -v wrt_data:/data navicaai/weather-routing-tool
+
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV WRT_HOME=/opt/wrt
+ENV DATA_DIR=/data
+ENV OUTPUT_DIR=/data/routes
+ENV CACHE_DIR=/data/.cache
+ENV PYTHONPATH=/opt/wrt/WeatherRoutingTool
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    build-essential \
+    libproj-dev \
+    libgeos-dev \
+    libgdal-dev \
+    libnetcdf-dev \
+    libhdf5-dev \
+    libpq-dev \
+    pkg-config \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create directories
+RUN mkdir -p /opt/wrt /data/routes /data/.cache
+
+WORKDIR /opt/wrt
+
+# Copy the WeatherRoutingTool package and server
+COPY WeatherRoutingTool ./WeatherRoutingTool
+COPY pyproject.toml requirements.txt requirements-without-deps.txt ./
+COPY local_server.py ./
+
+# Install WRT package and dependencies
+RUN pip install --no-cache-dir . && \
+    pip install --no-cache-dir --no-deps -r requirements-without-deps.txt
+
+# Install FastAPI server dependencies
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    requests \
+    xarray \
+    netcdf4 \
+    psycopg2-binary
+
+# Create non-root user
+RUN useradd -m -u 1000 app && \
+    chown -R app:app /opt/wrt /data
+USER app
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Start FastAPI server
+CMD ["python", "-m", "uvicorn", "local_server:app", "--host", "0.0.0.0", "--port", "8000"]
