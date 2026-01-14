@@ -2,7 +2,7 @@ import json
 import logging
 from itertools import product
 from math import ceil, gcd
-from typing import Generator, Optional
+from typing import Generator
 
 import networkx as nx
 import numpy as np
@@ -10,11 +10,10 @@ from astropy import units as u
 from geographiclib.geodesic import Geodesic
 from geographiclib.geodesicline import GeodesicLine
 from global_land_mask import is_land
-from shapely import Point, to_geojson, LineString
-import geopandas as gpd
+from shapely import Point, to_geojson
 
 from WeatherRoutingTool.algorithms.routingalg import RoutingAlg
-from WeatherRoutingTool.constraints.constraints import ConstraintsList, LandPolygonsCrossing
+from WeatherRoutingTool.constraints.constraints import ConstraintsList
 from WeatherRoutingTool.routeparams import RouteParams
 from WeatherRoutingTool.ship.ship import Boat
 from WeatherRoutingTool.ship.shipparams import ShipParams
@@ -59,17 +58,15 @@ def points_to_geojson(points: list[tuple[float, float]], filename: str = None, s
 
 class DijkstraGlobalLandMask(RoutingAlg):
     """
-    Grid-based Dijkstra algorithm implementation.
+    Grd-based Dijkstra algorithm implementation.
     The graph is created using the global land mask (https://github.com/toddkarin/global-land-mask) grid
     by connecting each grid point to a configurable number of neighbors.
-    Optionally supports polygon-based land detection for improved accuracy.
     """
     mask: np.array
     longitude: np.array
     latitude: np.array
     res_lat: float
     res_lon: float
-    land_polygon_detector: Optional[LandPolygonsCrossing]
 
     def __init__(self, config):
         """
@@ -84,23 +81,6 @@ class DijkstraGlobalLandMask(RoutingAlg):
         self.step = config.DIJKSTRA_STEP
         self.interval = 1000
         self.read_mask(config.DIJKSTRA_MASK_FILE)
-        
-        # Initialize polygon-based land detection if enabled in constraints
-        self.land_polygon_detector = None
-        if hasattr(config, 'CONSTRAINTS_LIST') and 'land_crossing_polygons' in config.CONSTRAINTS_LIST:
-            try:
-                logger.info("Dijkstra: Initializing polygon-based land detection")
-                map_bounds = ((self.map_ext.lat1, self.map_ext.lat2), 
-                             (self.map_ext.lon1, self.map_ext.lon2))
-                self.land_polygon_detector = LandPolygonsCrossing(map_size=self.map_ext)
-                if self.land_polygon_detector.initialization_successful:
-                    logger.info("Dijkstra: Polygon-based land detection enabled")
-                else:
-                    logger.warning("Dijkstra: Polygon detection initialization failed, using raster only")
-                    self.land_polygon_detector = None
-            except Exception as e:
-                logger.warning(f"Dijkstra: Could not initialize polygon detection: {e}")
-                self.land_polygon_detector = None
 
     def execute_routing(self, boat: Boat, wt: WeatherCond, constraints_list: ConstraintsList, verbose=False):
         method = 'dijkstra'
@@ -215,35 +195,13 @@ class DijkstraGlobalLandMask(RoutingAlg):
             line: GeodesicLine,
     ) -> bool:
         """
-        Check if the line has a point on land.
-        If polygon detection is enabled, check direct line intersection first for better accuracy.
-        Otherwise, fall back to point sampling along the line with the configured interval.
-        
-        :param line: Geodesic line to check
+        Check if the line has a point on land. The check is done for points along the line with the configured interval
+        and always includes the start and end point of the line.
+        :param line:
         :type line: geographiclib.geodesicline.GeodesicLine
-        :return: True if line crosses land, False otherwise
+        :return:
         :rtype: bool
         """
-        # Try polygon-based detection first (more accurate)
-        if self.land_polygon_detector is not None and self.land_polygon_detector.initialization_successful:
-            try:
-                # Get line endpoints
-                start_pos = line.Position(0, Geodesic.STANDARD | Geodesic.LONG_UNROLL)
-                end_pos = line.Position(line.s13, Geodesic.STANDARD | Geodesic.LONG_UNROLL)
-                
-                # Check if line segment intersects land polygons
-                lat_start = np.array([start_pos['lat2']])
-                lon_start = np.array([start_pos['lon2']])
-                lat_end = np.array([end_pos['lat2']])
-                lon_end = np.array([end_pos['lon2']])
-                
-                result = self.land_polygon_detector.check_crossing(lat_start, lon_start, lat_end, lon_end)
-                if result and len(result) > 0:
-                    return result[0]
-            except Exception as e:
-                logger.debug(f"Polygon check failed, falling back to raster: {e}")
-        
-        # Fall back to raster-based point sampling
         n = int(ceil(line.s13 / self.interval))
         for i in range(0, n+1):
             s = min(self.interval * i, line.s13)

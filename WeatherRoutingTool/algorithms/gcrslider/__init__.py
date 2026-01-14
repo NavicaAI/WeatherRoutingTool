@@ -3,8 +3,7 @@ import logging
 import math
 from copy import deepcopy
 from hashlib import sha256
-from typing import TypedDict, Optional
-from types import SimpleNamespace
+from typing import TypedDict
 
 import numpy as np
 from astropy import units as u
@@ -12,11 +11,9 @@ from geographiclib.geodesic import Geodesic
 from geographiclib.geodesicline import GeodesicLine
 from global_land_mask import is_land as is_land_global_land_mask
 from shapely import line_interpolate_point, LineString
-from shapely.geometry import Point, box
-from shapely.strtree import STRtree
 
 from WeatherRoutingTool.algorithms.routingalg import RoutingAlg
-from WeatherRoutingTool.constraints.constraints import ConstraintsList, LandPolygonsCrossing
+from WeatherRoutingTool.constraints.constraints import ConstraintsList
 from WeatherRoutingTool.routeparams import RouteParams
 from WeatherRoutingTool.ship.ship import Boat
 from WeatherRoutingTool.ship.shipparams import ShipParams
@@ -69,96 +66,6 @@ class GcrSliderAlgorithm(RoutingAlg):
                 'point': self.start
             }
         }
-        
-        # Initialize polygon-based land detection (optional, requires PostGIS)
-        self.use_polygon_detection = config.GCR_SLIDER_USE_POLYGON_LAND_DETECTION
-        self.land_polygon_detector: Optional[LandPolygonsCrossing] = None
-        if self.use_polygon_detection:
-            try:
-                map_bounds = self._calculate_map_bounds()
-                self.land_polygon_detector = LandPolygonsCrossing(
-                    map_size=map_bounds,
-                    db_engine=None  # Will auto-create from WRT_DB_* env vars
-                )
-                # Check if STRtree was created successfully and initialized
-                tree = getattr(self.land_polygon_detector, "land_polygon_STRTree", None)
-                if tree is not None and self.land_polygon_detector.initialization_successful:
-                    logger.info("Polygon-based land detection enabled.")
-                else:
-                    logger.warning(
-                        "Polygon land detection failed: no valid STRtree. Falling back to raster."
-                    )
-                    self.use_polygon_detection = False
-                    self.land_polygon_detector = None
-            except Exception as e:
-                logger.warning(f"Failed to initialize polygon land detection: {e}. Falling back to raster.")
-                self.use_polygon_detection = False
-                self.land_polygon_detector = None
-
-    def _calculate_map_bounds(self) -> SimpleNamespace:
-        """
-        Calculate bounding box for PostGIS land polygon queries.
-
-        Returns a SimpleNamespace with `lat1`, `lat2`, `lon1`, `lon2` to match
-        the structure expected by LandPolygonsCrossing.set_map_bbox.
-
-        :return: Bounding box coordinates
-        :rtype: SimpleNamespace
-        """
-        # Start with start and finish points
-        lats = [self.start[0], self.finish[0]]
-        lons = [self.start[1], self.finish[1]]
-
-        # Add intermediate waypoints if any
-        if self.waypoints:
-            for wp in self.waypoints:
-                lats.append(wp[0])
-                lons.append(wp[1])
-
-        # Add buffer (10% of range or 1 degree minimum)
-        lat_range = max(abs(max(lats) - min(lats)), 1.0)
-        lon_range = max(abs(max(lons) - min(lons)), 1.0)
-        buffer = max(lat_range * 0.1, lon_range * 0.1, 1.0)
-
-        min_lat = max(min(lats) - buffer, -90.0)
-        max_lat = min(max(lats) + buffer, 90.0)
-        min_lon = max(min(lons) - buffer, -180.0)
-        max_lon = min(max(lons) + buffer, 180.0)
-
-        # LandPolygonsCrossing expects an object with lat1/lat2/lon1/lon2 attributes.
-        return SimpleNamespace(lat1=min_lat, lat2=max_lat, lon1=min_lon, lon2=max_lon)
-    
-    def _check_polygon_intersection(self, lat_start: float, lon_start: float, 
-                                   lat_end: float, lon_end: float) -> bool:
-        """
-        Check if line segment intersects land polygons using LandPolygonsCrossing.
-        
-        :param lat_start: Start latitude
-        :type lat_start: float
-        :param lon_start: Start longitude
-        :type lon_start: float
-        :param lat_end: End latitude
-        :type lat_end: float
-        :param lon_end: End longitude
-        :type lon_end: float
-        :return: True if line crosses land
-        :rtype: bool
-        """
-        if self.land_polygon_detector is None:
-            return False
-        
-        try:
-            # Use check_crossing method from LandPolygonsCrossing
-            result = self.land_polygon_detector.check_crossing(
-                np.array([lat_start]),
-                np.array([lon_start]),
-                np.array([lat_end]),
-                np.array([lon_end])
-            )
-            return result[0] if result else False
-        except Exception as e:
-            logger.warning(f"Polygon intersection check failed: {e}. Falling back to raster.")
-            return False
 
     def adjust_parameters(self, line_length: float):
         """
@@ -196,7 +103,6 @@ class GcrSliderAlgorithm(RoutingAlg):
         return clusters
 
     def execute(self) -> tuple[RouteParams, int]:
-        logger.info(f"GCR Slider execute() starting. Polygon detection enabled: {self.use_polygon_detection}")
         self.sequence_id = 0
         self.found_id = 0
         self.points = {
@@ -207,10 +113,8 @@ class GcrSliderAlgorithm(RoutingAlg):
             }
         }
         if len(self.waypoints) > 0:
-            logger.info(f"Processing {len(self.waypoints)} intermediate waypoints")
             fixed_points = [self.start] + self.waypoints + [self.finish]
             for waypoint_idx in range(len(fixed_points)-1):
-                logger.info(f"Checking segment {waypoint_idx}: {fixed_points[waypoint_idx]} -> {fixed_points[waypoint_idx+1]}")
                 self.split_segments(fixed_points[waypoint_idx], fixed_points[waypoint_idx+1])
                 point_id = self.get_point_id(fixed_points[waypoint_idx+1])
                 self.sequence_id += 1
@@ -294,8 +198,6 @@ class GcrSliderAlgorithm(RoutingAlg):
     ) -> bool:
         """
         Check if the line has a point on land.
-        If polygon detection is enabled, check direct line intersection first.
-        Otherwise, fall back to point sampling along the line.
 
         :param line:
         :type line: geographiclib.geodesicline.GeodesicLine
@@ -304,24 +206,6 @@ class GcrSliderAlgorithm(RoutingAlg):
         :return:
         :rtype: bool
         """
-        # If polygon detection is enabled, check direct line intersection
-        if self.use_polygon_detection and self.land_polygon_detector is not None:
-            try:
-                # Get start and end points from the line
-                start_pos = line.Position(0, Geodesic.STANDARD | Geodesic.LONG_UNROLL)
-                end_pos = line.Position(line.s13, Geodesic.STANDARD | Geodesic.LONG_UNROLL)
-                
-                if self._check_polygon_intersection(
-                    start_pos['lat2'], start_pos['lon2'],
-                    end_pos['lat2'], end_pos['lon2']
-                ):
-                    logger.info(f"Polygon check: Line crosses land")
-                    return True
-                logger.debug(f"Polygon check: Line over water")
-            except Exception as e:
-                logger.warning(f"Polygon line check failed: {e}. Using point sampling.")
-        
-        # Fallback to point sampling (original method)
         n = int(math.ceil(line.s13 / interval))
         for i in range(0, n+1):
             s = min(interval * i, line.s13)
@@ -358,11 +242,9 @@ class GcrSliderAlgorithm(RoutingAlg):
     def is_land(self, lat: float, lon: float) -> bool:
         """
         Check if the point is on land.
-        If polygon detection is enabled, checks polygons first, then falls back to raster.
         If a buffer is specified, check also the surrounding of the point.
         The check is done by sampling and checking points on a circle with
         the given buffer distance as radius in predefined angular steps.
-        FIXED: Now also checks intermediate points along lines to buffer points.
 
         :param lat: latitude
         :type lat: float
@@ -371,42 +253,13 @@ class GcrSliderAlgorithm(RoutingAlg):
         :return:
         :rtype: bool
         """
-        # If polygon detection is enabled, check polygon first for center point
-        if self.use_polygon_detection and self.land_polygon_detector is not None:
-            try:
-                from shapely.geometry import Point
-                point = Point(lon, lat)
-                intersections = self.land_polygon_detector.land_polygon_STRTree.query(point, predicate="intersects")
-                is_on_land = len(intersections) > 0
-                if is_on_land:
-                    return True
-            except Exception as e:
-                logger.debug(f"Polygon point check failed: {e}. Using raster.")
-        
-        # Fallback to raster-based check (original method)
-        # Check center point
-        raster_result = is_land_global_land_mask(lat, lon)
-        if raster_result:
-            logger.debug(f"is_land: Point ({lat:.4f}, {lon:.4f}) IS LAND (raster)")
+        # FIXME: could be improved by checking also points on the line between the original point and the point moved
+        #  by the specific distance. With the current implementation islands could be ignored.
+        if is_land_global_land_mask(lat, lon):
             return True
-        
-        # Check buffer zone by sampling points on circle
         if self.land_buffer > 0:
             for angle in [i*self.angle_step for i in range(math.ceil(360/self.angle_step))]:
                 p = geod.Direct(lat, lon, angle, self.land_buffer)
-                
-                # Also check intermediate points along the line to buffer point
-                # This prevents missing narrow land features (fixes FIXME)
-                line_to_buffer = geod.InverseLine(lat, lon, p['lat2'], p['lon2'])
-                check_interval = min(500, self.land_buffer / 5)  # Check every 500m or at least 5 points
-                n_checks = int(math.ceil(line_to_buffer.s13 / check_interval))
-                for j in range(1, n_checks + 1):
-                    s = min(check_interval * j, line_to_buffer.s13)
-                    pt = line_to_buffer.Position(s, Geodesic.STANDARD | Geodesic.LONG_UNROLL)
-                    if is_land_global_land_mask(pt['lat2'], pt['lon2']):
-                        return True
-                
-                # Check the buffer point itself
                 if is_land_global_land_mask(p['lat2'], p['lon2']):
                     return True
         return False
@@ -434,7 +287,7 @@ class GcrSliderAlgorithm(RoutingAlg):
         # FIXME: continue implementation...
         return []
 
-    def split_segments(self, start: tuple[float, float], end: tuple[float, float], depth: int = 0):
+    def split_segments(self, start: tuple[float, float], end: tuple[float, float]):
         """
         Check if a segment crosses land. Divide segment if it does. The segment is divided at its midpoint.
         If the midpoint is on land it is moved incrementally by a defined distance until it is not on land.
@@ -443,17 +296,8 @@ class GcrSliderAlgorithm(RoutingAlg):
         :type start: tuple[float, float]
         :param end: end point of segment
         :type end: tuple[float, float]
-        :param depth: recursion depth (to prevent infinite loops in complex coastlines)
-        :type depth: int
         """
-        MAX_RECURSION_DEPTH = 15  # Limit recursion to prevent infinite loops
-        
-        if depth >= MAX_RECURSION_DEPTH:
-            logger.warning(f"Maximum recursion depth ({MAX_RECURSION_DEPTH}) reached for segment {start} -> {end}. "
-                         f"Accepting segment even though it may cross land. Complex coastlines may require different waypoints.")
-            return
-        
-        logger.info(f"Check segment from {start} to {end} (depth={depth}).")
+        logger.info(f"Check segment from {start} to {end}.")
         line = geod.InverseLine(start[0], start[1], end[0], end[1])
         if self.has_point_on_land(line):
             logger.info("Segment crosses land. Split segment at midpoint.")
@@ -494,19 +338,6 @@ class GcrSliderAlgorithm(RoutingAlg):
                         break
                     logger.debug("New point still on land.")
                     i += 1
-                
-                # CRITICAL FIX: After moving point off land, verify BOTH new segments are clear
-                # This fixes the bug where segments to/from moved points can still cross land
-                line_to_new = geod.InverseLine(start[0], start[1], new_point[0], new_point[1])
-                line_from_new = geod.InverseLine(new_point[0], new_point[1], end[0], end[1])
-                
-                if self.has_point_on_land(line_to_new) or self.has_point_on_land(line_from_new):
-                    logger.warning(
-                        f"Moved point {new_point} to water, but new segments still cross land. "
-                        f"This can happen with complex coastlines. Recursion will continue."
-                    )
-                    # Don't break - the recursive calls below will handle remaining crossings
-                
                 logger.info(f"Found new point {new_point}.")
                 # Note: the order of the following lines is important to have the correct order of points in the route
                 point_id = self.get_point_id(new_point)
@@ -514,11 +345,11 @@ class GcrSliderAlgorithm(RoutingAlg):
                 if self.found_id > self.max_nof_points:
                     raise RuntimeError(f"Reached maximum number of allowed points ({self.max_nof_points}).")
                 self.points[point_id] = {'point': new_point, 'found_id': self.found_id}
-                self.split_segments(start, new_point, depth + 1)
+                self.split_segments(start, new_point)
                 self.sequence_id += 1
                 self.points[point_id].update({'seq_id': self.sequence_id})
                 logger.debug(f"Add point {new_point} with route sequence id: {self.sequence_id}")
-                self.split_segments(new_point, end, depth + 1)
+                self.split_segments(new_point, end)
             else:
                 logger.info(f"Segment length below threshold: {line.s13} m < {self.threshold} m. No splitting.")
         else:

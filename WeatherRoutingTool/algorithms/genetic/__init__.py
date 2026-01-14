@@ -134,13 +134,11 @@ class Genetic(RoutingAlg):
 
         start_time = time.time()
 
-        # save_history=True enables plotting but causes deepcopy/pickle errors with some constraints
-        save_history = getattr(self.config, 'GENETIC_SAVE_HISTORY', False)
         algorithm.setup(
             problem=problem,
             algorithm=algorithm,
             termination=termination,
-            save_history=save_history,
+            save_history=True,
             verbose=True, )
 
         while algorithm.has_next():

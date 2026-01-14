@@ -779,8 +779,7 @@ class IsoBased(RoutingAlg):
         constraints_list.reached_positive()
         self.finish_temp = constraints_list.get_current_destination()
         self.start_temp = constraints_list.get_current_start()
-        # calculate_gcr returns (azimuth, distance) tuple - extract just the azimuth
-        self.gcr_course_temp = self.calculate_gcr(self.start_temp, self.finish_temp)[0] * u.degree
+        self.gcr_course_temp = self.calculate_gcr(self.start_temp, self.finish_temp) * u.degree
         self.status.update_state("routing")
 
         logger.info('Initiating routing for next segment going from ' + str(self.start_temp) + ' to ' + str(
@@ -1206,9 +1205,7 @@ class IsoBased(RoutingAlg):
         if trim:
             for i in range(len(bin_edges) - 1):
                 try:
-                    # Skip bins where best route has zero or negative progress
-                    # Negative progress indicates constraint violations (e.g., land crossing)
-                    if (bin_stat[i] <= 0):
+                    if (bin_stat[i] == 0):
                         continue
                     idxs.append(np.where(self.full_dist_traveled == bin_stat[i])[0][0])
                 except IndexError:
@@ -1400,9 +1397,7 @@ class IsoBased(RoutingAlg):
             specific_route_group = df_grouped_by_routes_has_same_origin.get_group(unique_key)
 
             max_dist = specific_route_group['dist'].max()
-            # Skip branches where best route has zero or negative progress
-            # Negative progress indicates constraint violations (e.g., land crossing)
-            if max_dist <= 0.:
+            if max_dist == 0.:
                 continue
 
             max_dist_indxs = specific_route_group[specific_route_group['dist'] == max_dist]['st_index']
@@ -1741,24 +1736,6 @@ class IsoBased(RoutingAlg):
                 self.full_dist_traveled = travel_dist['s12'] * travel_dist['s12'] / dist_to_dest['s12']
             if self.minimisation_criterion == 'dist':
                 self.full_dist_traveled = travel_dist['s12']
-            if self.minimisation_criterion == 'progress':
-                # Calculate actual progress toward destination
-                # initial_dist is distance from start to finish (current segment)
-                initial_dist = geod.inverse(start_lats, start_lons, end_lats, end_lons)['s12']
-                # Progress = how much closer we got to destination
-                # Positive means we're closer, negative means we went further away
-                progress = initial_dist - dist_to_dest['s12']
-                
-                # CRITICAL: Heavily penalize constrained routes (crossing land, etc.)
-                # Use a large negative value so they're never selected in pruning
-                # -1e9 is large enough to ensure these routes are always rejected
-                progress[is_constrained] = -1e9
-                
-                # Also penalize routes going backward (but less severely)
-                # They get zero progress, but constrained routes get negative
-                progress[(progress < 0) & ~np.array(is_constrained)] = 0
-                
-                self.full_dist_traveled = progress
         else:
             self.full_dist_traveled = travel_dist['s12']
         # ToDo: use logger.debug and args.debug
@@ -1894,8 +1871,7 @@ class IsoBased(RoutingAlg):
         constraint_list.init_positive_lists(self.start, self.finish)
         self.finish_temp = constraint_list.get_current_destination()
         self.start_temp = constraint_list.get_current_start()
-        # calculate_gcr returns (azimuth, distance) tuple - extract just the azimuth
-        self.gcr_course_temp = self.calculate_gcr(self.start_temp, self.finish_temp)[0] * u.degree
+        self.gcr_course_temp = self.calculate_gcr(self.start_temp, self.finish_temp) * u.degree
 
         logger.info('Currently going from')
         logger.info(self.start_temp)

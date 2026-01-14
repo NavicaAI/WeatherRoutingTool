@@ -59,7 +59,7 @@ class Config(BaseModel):
     # (via the ValidationInfo object) which have been declared earlier.
 
     # Other configuration
-    ALGORITHM_TYPE: Literal['astar', 'dijkstra', 'gcr_slider', 'genetic', 'genetic_shortest_route', 'greedy', 'isofuel',
+    ALGORITHM_TYPE: Literal['astar', 'dijkstra', 'gcr_slider', 'genetic', 'genetic_shortest_route', 'isofuel',
                             'speedy_isobased'] = 'isofuel'
 
     BOAT_TYPE: Literal['CBT', 'SAL', 'speedy_isobased', 'direct_power_method'] = 'direct_power_method'  # options: 'CBT', 'SAL','speedy_isobased', 'direct_power_method  # noqa: E501
@@ -123,21 +123,13 @@ class Config(BaseModel):
     GENETIC_FIX_RANDOM_SEED: bool = False
     GENETIC_SAVE_HISTORY: bool = False  # Set to True to enable history for plotting (can cause pickle errors)
 
-    # Options for Greedy algorithm
-    # Simple, intuitive routing that always picks direction with most progress toward destination
-    GREEDY_DELTA_FUEL_KG: float = 1000.0  # Fuel budget per step (kg) - smaller = higher resolution
-    GREEDY_HEADING_SAMPLES: int = 72  # Number of directions to sample (72 = every 5 degrees)
-    GREEDY_MAX_ITERATIONS: int = 500  # Safety limit to prevent infinite loops
-    GREEDY_ARRIVAL_THRESHOLD_M: float = 5000.0  # Consider arrived when within this distance (meters)
-    GREEDY_USE_WEATHER: bool = True  # Whether to use weather data for speed/fuel calculations
-
     INTERMEDIATE_WAYPOINTS: Annotated[
         list[Annotated[list[Union[int, float]], Field(min_length=2, max_length=2)]],
         Field(default_factory=list)]  # [[lat_one,lon_one], [lat_two,lon_two] ... ]
 
     # options for isobased algorithms
     ISOCHRONE_MAX_ROUTING_STEPS: int = 100  # maximum number of routing steps
-    ISOCHRONE_MINIMISATION_CRITERION: Literal['dist', 'squareddist_over_disttodest', 'progress'] = 'squareddist_over_disttodest'
+    ISOCHRONE_MINIMISATION_CRITERION: Literal['dist', 'squareddist_over_disttodest'] = 'squareddist_over_disttodest'
     # options: 'dist', 'squareddist_over_disttodest', 'progress'
     # 'progress' rewards movement toward destination, good for calm weather routes
     ISOCHRONE_NUMBER_OF_ROUTES: int = 1  # integer specifying how many routes should be searched

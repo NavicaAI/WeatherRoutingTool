@@ -5,7 +5,6 @@ from WeatherRoutingTool.algorithms.astar_router import AStarRouter
 from WeatherRoutingTool.algorithms.dijkstra import DijkstraGlobalLandMask
 from WeatherRoutingTool.algorithms.genetic import Genetic
 from WeatherRoutingTool.algorithms.gcrslider import GcrSliderAlgorithm
-from WeatherRoutingTool.algorithms.greedy import GreedyRouter
 from WeatherRoutingTool.algorithms.isofuel import IsoFuel
 
 logger = logging.getLogger('WRT')
@@ -34,9 +33,6 @@ class RoutingAlgFactory:
 
         if config.ALGORITHM_TYPE == 'gcr_slider':
             ra = GcrSliderAlgorithm(config)
-
-        if config.ALGORITHM_TYPE == 'greedy':
-            ra = GreedyRouter(config)
 
         if config.ALGORITHM_TYPE == 'astar':
             ra = AStarRouter(config)
