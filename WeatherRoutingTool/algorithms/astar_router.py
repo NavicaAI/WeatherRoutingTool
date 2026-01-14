@@ -93,6 +93,10 @@ class AStarRouter(RoutingAlg):
         self.weather: Optional[WeatherCond] = None
         self.boat: Optional[Boat] = None
         
+        # Wind cache for performance (grid-based)
+        self._wind_cache: Optional[dict] = None
+        self._wind_cache_time: Optional[datetime] = None
+        
     def print_init(self):
         logger.info(f"A* Router initialized:")
         logger.info(f"  Region: ({self.lat_min:.2f}, {self.lon_min:.2f}) to ({self.lat_max:.2f}, {self.lon_max:.2f})")
@@ -265,6 +269,108 @@ class AStarRouter(RoutingAlg):
         
         return False
     
+    def _smooth_path(self, path: list, mandatory_points: list = None) -> list:
+        """
+        Smooth the path by:
+        1. Removing collinear intermediate points (same direction)
+        2. Shortcutting where possible without crossing land
+        
+        Mandatory points (like user-specified waypoints) are always preserved.
+        
+        Args:
+            path: List of (lat, lon) tuples
+            mandatory_points: List of (lat, lon) tuples that must be preserved
+            
+        Returns:
+            Smoothed path with fewer waypoints
+        """
+        if len(path) <= 2:
+            return path
+        
+        # Build set of mandatory points for fast lookup
+        mandatory_set = set()
+        if mandatory_points:
+            for pt in mandatory_points:
+                # Use rounded coordinates for comparison (to handle floating point)
+                mandatory_set.add((round(pt[0], 6), round(pt[1], 6)))
+        
+        def is_mandatory(pt):
+            return (round(pt[0], 6), round(pt[1], 6)) in mandatory_set
+        
+        logger.info(f"A*: Smoothing path with {len(path)} points ({len(mandatory_set)} mandatory)...")
+        
+        # Step 1: Remove collinear points (points that don't change direction significantly)
+        # Use bearing-based detection - if bearing change < threshold, point is redundant
+        # BUT: always keep mandatory points
+        BEARING_THRESHOLD = 2.0  # degrees - points with less than this bearing change are collinear
+        
+        simplified = [path[0]]
+        
+        for i in range(1, len(path) - 1):
+            prev = simplified[-1]
+            curr = path[i]
+            next_pt = path[i + 1]
+            
+            # Always keep mandatory points
+            if is_mandatory(curr):
+                simplified.append(curr)
+                continue
+            
+            # Calculate bearings
+            bearing1 = geod.Inverse(prev[0], prev[1], curr[0], curr[1])['azi1']
+            bearing2 = geod.Inverse(curr[0], curr[1], next_pt[0], next_pt[1])['azi1']
+            
+            # Normalize bearing difference to [-180, 180]
+            bearing_diff = bearing2 - bearing1
+            while bearing_diff > 180:
+                bearing_diff -= 360
+            while bearing_diff < -180:
+                bearing_diff += 360
+            
+            # Keep point if there's a significant direction change
+            if abs(bearing_diff) > BEARING_THRESHOLD:
+                simplified.append(curr)
+        
+        simplified.append(path[-1])
+        
+        logger.info(f"A*: After collinear removal: {len(simplified)} points (removed {len(path) - len(simplified)})")
+        
+        # Step 2: Try to shortcut - skip intermediate waypoints where direct path is clear
+        # Use a greedy approach: try to skip as many points as possible from each position
+        # BUT: never skip mandatory points
+        shortcut = [simplified[0]]
+        i = 0
+        
+        while i < len(simplified) - 1:
+            # Find the next mandatory point (if any) after current position
+            next_mandatory_idx = None
+            for k in range(i + 1, len(simplified)):
+                if is_mandatory(simplified[k]):
+                    next_mandatory_idx = k
+                    break
+            
+            # Try to skip ahead as far as possible, but not past the next mandatory point
+            best_skip = i + 1  # At minimum, go to next point
+            max_skip = next_mandatory_idx if next_mandatory_idx else len(simplified) - 1
+            
+            for j in range(max_skip, i, -1):
+                # Check if we can go directly from i to j without crossing land
+                if not self._edge_crosses_land(
+                    simplified[i][0], simplified[i][1],
+                    simplified[j][0], simplified[j][1]
+                ):
+                    best_skip = j
+                    break
+            
+            # Add the target point
+            shortcut.append(simplified[best_skip])
+            i = best_skip
+        
+        logger.info(f"A*: After shortcutting: {len(shortcut)} points (removed {len(simplified) - len(shortcut)})")
+        logger.info(f"A*: Total smoothing: {len(path)} -> {len(shortcut)} points ({100*(len(path)-len(shortcut))/len(path):.1f}% reduction)")
+        
+        return shortcut
+    
     def _find_nearest_node(self, lat: float, lon: float) -> Tuple[float, float]:
         """Find the nearest graph node to a position."""
         if self.graph is None:
@@ -375,18 +481,74 @@ class AStarRouter(RoutingAlg):
             logger.debug(f"Weather lookup failed for edge: {e}")
             return distance / base_speed
     
+    def _preload_wind_cache(self, time: datetime):
+        """Pre-load wind data for the entire grid at a given time."""
+        if self.weather is None or not hasattr(self.weather, 'ds') or self.weather.ds is None:
+            self._wind_cache = None
+            return
+        
+        try:
+            ds = self.weather.ds
+            time_str = time.strftime('%Y-%m-%d %H:00:00')
+            
+            # Get u/v arrays for entire grid
+            if 'u' in ds.data_vars and 'v' in ds.data_vars:
+                u_data = ds['u'].sel(time=time_str, method='nearest')
+                v_data = ds['v'].sel(time=time_str, method='nearest')
+            elif 'u-component_of_wind_height_above_ground' in ds.data_vars:
+                u_data = ds['u-component_of_wind_height_above_ground'].sel(
+                    time=time_str, height_above_ground=10, method='nearest')
+                v_data = ds['v-component_of_wind_height_above_ground'].sel(
+                    time=time_str, height_above_ground=10, method='nearest')
+            else:
+                self._wind_cache = None
+                return
+            
+            # Create interpolation functions for fast lookup
+            lats = u_data.latitude.values
+            lons = u_data.longitude.values
+            
+            from scipy.interpolate import RegularGridInterpolator
+            self._wind_cache = {
+                'u_interp': RegularGridInterpolator((lats, lons), u_data.values, method='linear', bounds_error=False, fill_value=0.0),
+                'v_interp': RegularGridInterpolator((lats, lons), v_data.values, method='linear', bounds_error=False, fill_value=0.0),
+            }
+            self._wind_cache_time = time
+            logger.info(f"A*: Pre-loaded wind cache for {time_str}")
+            
+        except Exception as e:
+            logger.warning(f"A*: Failed to preload wind cache: {e}")
+            self._wind_cache = None
+    
     def _get_wind(self, lat: float, lon: float, time: datetime) -> Tuple[float, float]:
-        """Get wind u,v components at a position."""
-        if self.weather is None:
+        """Get wind u,v components at a position using cached interpolators."""
+        # Use cached interpolator if available
+        if self._wind_cache is not None:
+            try:
+                u = float(self._wind_cache['u_interp']((lat, lon)))
+                v = float(self._wind_cache['v_interp']((lat, lon)))
+                return u, v
+            except Exception:
+                pass
+        
+        # Fallback to direct lookup (slower)
+        if self.weather is None or not hasattr(self.weather, 'ds') or self.weather.ds is None:
             return 0.0, 0.0
         
         try:
-            # Try to get from weather data
-            wind_u = float(self.weather.get_wind_at_point(lat, lon, time, 'u'))
-            wind_v = float(self.weather.get_wind_at_point(lat, lon, time, 'v'))
-            return wind_u, wind_v
-        except:
-            return 0.0, 0.0
+            ds = self.weather.ds
+            time_str = time.strftime('%Y-%m-%d %H:00:00')
+            
+            if 'u' in ds.data_vars and 'v' in ds.data_vars:
+                u_data = ds['u'].sel(time=time_str, method='nearest')
+                v_data = ds['v'].sel(time=time_str, method='nearest')
+                wind_u = float(u_data.interp(latitude=lat, longitude=lon).values)
+                wind_v = float(v_data.interp(latitude=lat, longitude=lon).values)
+                return wind_u, wind_v
+        except Exception:
+            pass
+        
+        return 0.0, 0.0
     
     def execute_routing(self, boat: Boat, wt: WeatherCond, 
                         constraints_list: ConstraintsList, verbose=False) -> Tuple[RouteParams, int]:
@@ -398,6 +560,13 @@ class AStarRouter(RoutingAlg):
         logger.info("Starting A* Weather Routing")
         logger.info(f"From: {self.start} To: {self.finish}")
         logger.info(f"Weather: {'enabled' if self.weather else 'disabled (calm)'}")
+        
+        # Pre-load wind cache for fast lookups
+        if self.weather is not None:
+            self._preload_wind_cache(self.departure_time)
+            # Debug: test wind lookup
+            test_wind = self._get_wind(self.start[0], self.start[1], self.departure_time)
+            logger.info(f"A*: Wind at start: u={test_wind[0]:.2f}, v={test_wind[1]:.2f} m/s")
         
         # Get intermediate waypoints from constraints (if any)
         waypoints = []
@@ -484,7 +653,12 @@ class AStarRouter(RoutingAlg):
         # Add actual end point
         full_path.append(self.finish)
         
-        logger.info(f"A*: Total path: {len(full_path)} points in {total_search_time:.2f}s")
+        logger.info(f"A*: Raw path: {len(full_path)} points in {total_search_time:.2f}s")
+        
+        # Smooth the path - remove redundant points and shortcut where safe
+        # Pass waypoints as mandatory points so they're preserved
+        mandatory_points = [self.start] + waypoints + [self.finish]
+        full_path = self._smooth_path(full_path, mandatory_points)
         
         # Build RouteParams
         lats = [p[0] for p in full_path]
