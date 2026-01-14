@@ -870,7 +870,7 @@ async def run_single_routing_pass(
         "ISOCHRONE_PRUNE_SEGMENTS": 20,
         # Use 'progress' criterion - rewards progress toward destination
         # Combined with 'larger_direction' pruning (default), this prevents overshooting
-        "ISOCHRONE_MINIMISATION_CRITERION": "progress",
+        "ISOCHRONE_MINIMISATION_CRITERION": "squareddist_over_disttodest",
         "ISOCHRONE_NUMBER_OF_ROUTES": 1,
         
         "GENETIC_NUMBER_GENERATIONS": 15,

@@ -302,6 +302,7 @@ class AStarRouter(RoutingAlg):
         # Step 1: Remove collinear points (points that don't change direction significantly)
         # Use bearing-based detection - if bearing change < threshold, point is redundant
         # BUT: always keep mandatory points
+        # IMPORTANT: Verify the shortcut doesn't cross land before removing a point
         BEARING_THRESHOLD = 2.0  # degrees - points with less than this bearing change are collinear
         
         simplified = [path[0]]
@@ -329,6 +330,13 @@ class AStarRouter(RoutingAlg):
             
             # Keep point if there's a significant direction change
             if abs(bearing_diff) > BEARING_THRESHOLD:
+                simplified.append(curr)
+                continue
+            
+            # Even if collinear, check that skipping this point doesn't cross land
+            # This is critical for paths that follow coastlines
+            if self._edge_crosses_land(prev[0], prev[1], next_pt[0], next_pt[1]):
+                # Can't skip - the direct path crosses land
                 simplified.append(curr)
         
         simplified.append(path[-1])
@@ -367,6 +375,19 @@ class AStarRouter(RoutingAlg):
             i = best_skip
         
         logger.info(f"A*: After shortcutting: {len(shortcut)} points (removed {len(simplified) - len(shortcut)})")
+        
+        # Step 3: Final validation - verify no segments cross land
+        # If any do, fall back to the original path for safety
+        land_crossings = []
+        for i in range(len(shortcut) - 1):
+            if self._edge_crosses_land(shortcut[i][0], shortcut[i][1], shortcut[i+1][0], shortcut[i+1][1]):
+                land_crossings.append(i)
+        
+        if land_crossings:
+            logger.warning(f"A*: Smoothed path has {len(land_crossings)} land crossings at segments {land_crossings}!")
+            logger.warning(f"A*: Falling back to original unsmoothed path for safety")
+            return path
+        
         logger.info(f"A*: Total smoothing: {len(path)} -> {len(shortcut)} points ({100*(len(path)-len(shortcut))/len(path):.1f}% reduction)")
         
         return shortcut
