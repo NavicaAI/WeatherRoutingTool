@@ -630,6 +630,60 @@ class AStarRouter(RoutingAlg):
         
         return shortcut
     
+    def _interpolate_long_segments(self, path: list, max_segment_km: float = 500.0) -> list:
+        """
+        Add intermediate waypoints along long segments to ensure proper geodesic rendering.
+        
+        On flat map projections (Mercator, etc.), straight lines between lat/lon coordinates
+        don't follow the actual geodesic (great circle) path. For long segments, this can
+        make a route appear to cross land even when the actual geodesic path is over water.
+        
+        This function interpolates intermediate points along the geodesic for any segment
+        longer than max_segment_km, ensuring the route renders correctly on maps.
+        
+        Args:
+            path: List of (lat, lon) tuples
+            max_segment_km: Maximum segment length in km before interpolation (default 500km)
+            
+        Returns:
+            Path with intermediate waypoints added for long segments
+        """
+        if len(path) <= 1:
+            return path
+        
+        interpolated = []
+        
+        for i in range(len(path) - 1):
+            lat1, lon1 = path[i]
+            lat2, lon2 = path[i + 1]
+            
+            # Always add the start point of this segment
+            interpolated.append((lat1, lon1))
+            
+            # Calculate segment distance
+            line = geod.InverseLine(lat1, lon1, lat2, lon2)
+            dist_km = line.s13 / 1000.0
+            
+            # If segment is long, add intermediate points along geodesic
+            if dist_km > max_segment_km:
+                n_points = int(dist_km / max_segment_km)
+                for j in range(1, n_points + 1):
+                    # Position along the geodesic
+                    s = (line.s13 * j) / (n_points + 1)
+                    g = line.Position(s)
+                    # Round to 2 decimal places for cleaner output
+                    interpolated.append((round(g['lat2'], 2), round(g['lon2'], 2)))
+        
+        # Add the final point
+        interpolated.append(path[-1])
+        
+        if len(interpolated) > len(path):
+            added = len(interpolated) - len(path)
+            logger.info(f"A*: Interpolated {added} intermediate waypoints for map rendering")
+            print(f"[A*] Added {added} intermediate waypoints for geodesic rendering", flush=True)
+        
+        return interpolated
+    
     def _find_nearest_node(self, lat: float, lon: float) -> Tuple[float, float]:
         """Find the nearest graph node to a position."""
         if self.graph is None:
@@ -1168,28 +1222,47 @@ class AStarRouter(RoutingAlg):
         # Ensure graph covers the route - dynamically expand if needed
         # This allows routing to ANY location without hard-coded bounds
         graph_expanded = self._ensure_graph_covers_route(self.start, self.finish, waypoints)
-        if graph_expanded:
-            logger.info("A*: Graph was expanded to cover this route")
         
-        # Load graph if not yet loaded (should be loaded by ensure_graph_covers_route)
+        # Load graph if not yet loaded (needed for snapping)
         if self.graph is None:
             self._load_or_build_graph()
         
+        # ============================================================
+        # SNAP ALL WAYPOINTS TO WATER NODES
+        # User-specified coordinates may be on land (ports, coastlines).
+        # The graph only contains water nodes, so we snap each waypoint
+        # to the nearest water node BEFORE routing.
+        # ============================================================
+        snapped_points = []
+        for i, pt in enumerate(all_points):
+            try:
+                snapped = self._find_nearest_node(pt[0], pt[1])
+                if snapped != pt:
+                    logger.info(f"A*: Snapped waypoint {i} ({pt[0]:.4f}, {pt[1]:.4f}) -> water node ({snapped[0]:.4f}, {snapped[1]:.4f})")
+                    print(f"[A*] Snapped waypoint {i} ({pt[0]:.3f}, {pt[1]:.3f}) -> ({snapped[0]:.3f}, {snapped[1]:.3f})", flush=True)
+                snapped_points.append(snapped)
+            except ValueError as e:
+                logger.error(f"A*: Could not snap waypoint {i} ({pt[0]:.4f}, {pt[1]:.4f}) to water: {e}")
+                return self._build_empty_route(), 1
+        
+        # Update all_points to use snapped (water-only) coordinates
+        all_points = snapped_points
+        snapped_start = snapped_points[0]
+        snapped_finish = snapped_points[-1]
+        snapped_waypoints = snapped_points[1:-1] if len(snapped_points) > 2 else []
+        if graph_expanded:
+            logger.info("A*: Graph was expanded to cover this route")
+        
         # Compute corridor bounds for the entire route (if enabled)
+        # Use original user coordinates for corridor (to be inclusive)
         search_graph = self.graph
         if self.use_corridor:
             corridor_bounds = self._compute_corridor_bounds(self.start, self.finish, waypoints)
             search_graph = self._create_corridor_subgraph(*corridor_bounds)
             
-            # Verify start/end nodes are in corridor subgraph
-            try:
-                start_node = self._find_nearest_node(self.start[0], self.start[1])
-                end_node = self._find_nearest_node(self.finish[0], self.finish[1])
-                if start_node not in search_graph or end_node not in search_graph:
-                    logger.warning("A* Corridor: Start/end nodes not in corridor, using full graph")
-                    search_graph = self.graph
-            except ValueError:
-                logger.warning("A* Corridor: Could not find start/end nodes, using full graph")
+            # Verify snapped start/end nodes are in corridor subgraph
+            if snapped_start not in search_graph or snapped_finish not in search_graph:
+                logger.warning("A* Corridor: Start/end nodes not in corridor, using full graph")
                 search_graph = self.graph
         
         # Create weight function for A*
@@ -1212,8 +1285,8 @@ class AStarRouter(RoutingAlg):
                 return float("inf")
             return self._compute_edge_weight(u, v, edge_data, current_time)
         
-        # Route through each segment (start -> wp1 -> wp2 -> ... -> finish)
-        full_path = [self.start]  # Start with actual start point
+        # Route through each segment using SNAPPED water coordinates
+        full_path = [snapped_start]  # Start with snapped water node (not raw user coord)
         total_search_time = 0.0
         
         for seg_idx in range(len(all_points) - 1):
@@ -1273,26 +1346,27 @@ class AStarRouter(RoutingAlg):
                 return self._build_empty_route(), 1
             
             # Add segment path (grid nodes)
-            # Skip first node if not first segment to avoid duplicates
-            if seg_idx == 0:
-                full_path.extend(segment_path)
-            else:
-                full_path.extend(segment_path[1:])
+            # Always skip first node to avoid duplicates (we already have the start of each segment)
+            full_path.extend(segment_path[1:])
             
-            # Add the actual waypoint at the end of this segment (if not the final segment)
-            # This ensures we hit the exact intermediate waypoint coordinates
-            if seg_idx < len(all_points) - 2:
-                full_path.append(seg_end)
+            # Note: seg_end is already a snapped water coordinate from all_points
+            # No need to add it separately as it's the start of the next segment
+            # (or already the last point which we handle below)
         
-        # Add actual end point
-        full_path.append(self.finish)
+        # Add snapped finish point (ensure it's the last point)
+        if full_path[-1] != snapped_finish:
+            full_path.append(snapped_finish)
         
         logger.info(f"A*: Raw path: {len(full_path)} points in {total_search_time:.2f}s")
         
         # Smooth the path - remove redundant points and shortcut where safe
-        # Pass waypoints as mandatory points so they're preserved
-        mandatory_points = [self.start] + waypoints + [self.finish]
+        # Pass SNAPPED waypoints as mandatory points so they're preserved
+        mandatory_points = [snapped_start] + snapped_waypoints + [snapped_finish]
         full_path = self._smooth_path(full_path, mandatory_points)
+        
+        # Interpolate long segments for proper geodesic rendering on maps
+        # This adds intermediate waypoints so the route displays correctly
+        full_path = self._interpolate_long_segments(full_path, max_segment_km=500.0)
         
         # Build RouteParams
         lats = [p[0] for p in full_path]
