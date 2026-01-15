@@ -55,6 +55,9 @@ OUTPUT_DIR = os.environ.get('OUTPUT_DIR', f'{DATA_DIR}/routes')
 CACHE_DIR = f"{DATA_DIR}/.cache"
 WEATHER_CACHE_TTL_SECONDS = int(os.environ.get('WEATHER_CACHE_TTL_SECONDS', '3600'))
 
+# Debug logging - set DEBUG_LOGGING=true to see full request/response JSON
+DEBUG_LOGGING = os.environ.get('DEBUG_LOGGING', 'true').lower() == 'true'
+
 # FROZEN TIME MODE: Reuse cached weather data indefinitely for rapid iteration
 FROZEN_TIME_MODE = os.environ.get('FROZEN_TIME_MODE', 'true').lower() == 'true'
 FROZEN_TIME_KEY = os.environ.get('FROZEN_TIME_KEY', 'sardinia_2026_01')
@@ -79,6 +82,110 @@ netcdf_lock = threading.Lock()
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# Land Proximity Grid for Smart Resolution Selection
+# ============================================================
+_land_proximity_grid = None
+
+def _load_land_proximity_grid():
+    """Load the pre-computed land proximity grid for fast lookups."""
+    global _land_proximity_grid
+    if _land_proximity_grid is not None:
+        return _land_proximity_grid
+    
+    # Try to load the pre-computed grid
+    grid_path = Path('/tmp/wrt_graph_cache/LAND_PROXIMITY_2.00deg_150km.pkl')
+    if grid_path.exists():
+        try:
+            with open(grid_path, 'rb') as f:
+                _land_proximity_grid = pickle.load(f)
+            print(f"[LandProx] Loaded land proximity grid: {grid_path.name}", flush=True)
+            return _land_proximity_grid
+        except Exception as e:
+            print(f"[LandProx] Failed to load grid: {e}", flush=True)
+    
+    return None
+
+
+def route_passes_near_land(route_points: list, threshold_km: float = 150.0) -> bool:
+    """
+    Check if a route passes within threshold_km of land.
+    
+    Uses pre-computed land proximity grid for fast lookups.
+    Falls back to conservative "True" if grid not available.
+    
+    Args:
+        route_points: List of (lat, lon) tuples along the route
+        threshold_km: Distance threshold in km
+        
+    Returns:
+        True if route passes near land, False if open ocean only
+    """
+    grid = _load_land_proximity_grid()
+    
+    if grid is None:
+        # No grid available - be conservative, assume near land
+        return True
+    
+    near_land = grid['near_land']
+    lats = grid['lats']
+    lons = grid['lons']
+    resolution = grid['resolution']
+    
+    # Check each route point
+    for lat, lon in route_points:
+        # Find nearest grid cell
+        lat_idx = int(round((lat - lats[0]) / resolution))
+        lon_idx = int(round((lon - lons[0]) / resolution))
+        
+        # Clamp to valid indices
+        lat_idx = max(0, min(lat_idx, len(lats) - 1))
+        lon_idx = max(0, min(lon_idx, len(lons) - 1))
+        
+        if near_land[lat_idx, lon_idx]:
+            return True
+    
+    return False
+
+
+def select_astar_resolution(route_distance_nm: float, route_points: list) -> float:
+    """
+    Select optimal A* grid resolution based on route distance and land proximity.
+    
+    Strategy:
+    - Short routes (<200nm): Fine resolution (0.05°)
+    - Medium routes (200-1000nm): Medium resolution (0.1°) 
+    - Long routes (1000-5000nm): Coarse resolution (0.25°)
+    - Very long routes (>5000nm):
+      - If passes near land/straits: 1.0° (need connectivity through straits)
+      - If open ocean only: 2.0° (can use coarse grid)
+    """
+    if route_distance_nm is None or route_distance_nm < 200:
+        return 0.05
+    elif route_distance_nm < 1000:
+        return 0.1
+    elif route_distance_nm < 5000:
+        return 0.25
+    else:
+        # Long route - check if it passes near land
+        if route_passes_near_land(route_points):
+            # Near land - need finer resolution for strait connectivity
+            return 1.0
+        else:
+            # Open ocean - can use coarse resolution
+            return 2.0
+
+
+def debug_log_response(response: "RouteResponse") -> "RouteResponse":
+    """Log full response JSON if DEBUG_LOGGING is enabled."""
+    if DEBUG_LOGGING:
+        print(f"\n[DEBUG] Full response JSON:", flush=True)
+        response_dict = response.model_dump()
+        print(json.dumps(response_dict, indent=2, default=str), flush=True)
+        print(f"{'='*60}\n", flush=True)
+    return response
+
 
 # ============================================================
 # Weather Data Cache
@@ -219,7 +326,8 @@ def fetch_marine_grid(
                 weather_response = requests.get(weather_url, params={
                     "latitude": lat, "longitude": lon,
                     "hourly": ",".join(wind_vars),
-                    "forecast_days": forecast_days
+                    "forecast_days": forecast_days,
+                    "wind_speed_unit": "ms"  # Request m/s instead of default km/h
                 }, timeout=10)
                 
                 point_data = {
@@ -379,7 +487,8 @@ def create_synthetic_weather(
     lon_min: float, lon_max: float,
     resolution: float = 1.0,
     time_hours: int = 168,  # Default 7 days
-    output_path: str = None
+    output_path: str = None,
+    departure_time: str = None  # ISO datetime string for base time
 ) -> xr.Dataset:
     """Create synthetic weather data for fast local development."""
     lats = np.arange(lat_min, lat_max + resolution, resolution)
@@ -388,8 +497,11 @@ def create_synthetic_weather(
     n_times = time_hours  # Use provided time range
     
     # Use numpy datetime64 for netCDF compatibility
-    # In FROZEN_TIME_MODE, use FROZEN_DEPARTURE_TIME as base to ensure time coverage
-    if FROZEN_TIME_MODE:
+    # Base time priority: departure_time > FROZEN_DEPARTURE_TIME > now()
+    if departure_time:
+        dep_dt = datetime.fromisoformat(departure_time.replace('Z', '+00:00')).replace(tzinfo=None)
+        base_time = np.datetime64(dep_dt)
+    elif FROZEN_TIME_MODE:
         frozen_dt = datetime.fromisoformat(FROZEN_DEPARTURE_TIME.replace('Z', '+00:00')).replace(tzinfo=None)
         base_time = np.datetime64(frozen_dt)
     else:
@@ -552,6 +664,27 @@ class CalculatedRoute(BaseModel):
     total_distance_nm: float
     total_time_hours: float
 
+class WeatherHazardSummary(BaseModel):
+    """Summary of weather hazards encountered during routing."""
+    hazards_detected: int = 0
+    hazards_avoided: int = 0
+    hazards_traversed: int = 0
+
+class WeatherHazard(BaseModel):
+    """Individual weather hazard location."""
+    lat: float
+    lon: float
+    wind_speed_kts: float
+    wave_height_m: Optional[float] = None
+    status: str  # "avoided" or "traversed"
+    reason: Optional[str] = None  # "mandatory_waypoint" or "no_alternative"
+
+class WeatherHazardReport(BaseModel):
+    """Full weather hazard report from routing."""
+    hazards: List[WeatherHazard] = []
+    summary: WeatherHazardSummary = WeatherHazardSummary()
+    thresholds: dict = {}
+
 class RouteResponse(BaseModel):
     success: bool
     error: Optional[str] = None
@@ -562,6 +695,7 @@ class RouteResponse(BaseModel):
     weather_cached: bool = False
     algorithm_used: Optional[str] = None
     weather_source_used: Optional[str] = None
+    weather_hazards: Optional[WeatherHazardReport] = None
 
 class HealthResponse(BaseModel):
     status: str
@@ -699,10 +833,20 @@ def validate_route_land_crossings(coords: list, map_size_tuple: tuple) -> dict:
 
 
 def run_wrt_direct(config_dict: dict, output_dir: str) -> dict:
-    """Run WRT directly using Python imports instead of subprocess."""
+    """Run WRT directly using Python imports instead of subprocess.
+    
+    For A* algorithm with weather avoidance enabled, captures and returns weather hazard report.
+    """
     import tempfile
+    from WeatherRoutingTool.ship.ship_factory import ShipFactory
+    from WeatherRoutingTool.weather_factory import WeatherFactory
+    from WeatherRoutingTool.constraints.constraints import ConstraintsListFactory, WaterDepth
+    from WeatherRoutingTool.algorithms.routingalg_factory import RoutingAlgFactory
+    from WeatherRoutingTool.utils.maps import Map
     
     config_path = Path(tempfile.mktemp(suffix='.json'))
+    weather_hazards = None
+    
     try:
         with open(config_path, 'w') as f:
             json.dump(config_dict, f, indent=2)
@@ -712,7 +856,64 @@ def run_wrt_direct(config_dict: dict, output_dir: str) -> dict:
         print(f"[WRT] Constraints: {config_dict.get('CONSTRAINTS_LIST')}", flush=True)
         
         config = Config.assign_config(config_path)
-        execute_routing(config)
+        
+        # Run routing inline to capture the router object
+        windfile = config.WEATHER_DATA
+        depthfile = config.DEPTH_DATA
+        routepath = config.ROUTE_PATH
+        time_resolution = config.DELTA_TIME_FORECAST
+        time_forecast = config.TIME_FORECAST
+        lat1, lon1, lat2, lon2 = config.DEFAULT_MAP
+        departure_time = config.DEPARTURE_TIME
+        default_map = Map(lat1, lon1, lat2, lon2)
+        
+        # Initialize weather
+        wt = WeatherFactory.get_weather(
+            config._DATA_MODE_WEATHER, windfile, departure_time, 
+            time_forecast, time_resolution, default_map
+        )
+        
+        # Initialize boat
+        boat = ShipFactory.get_ship(config)
+        
+        # Initialize constraints
+        water_depth = WaterDepth(
+            config._DATA_MODE_DEPTH, boat.get_required_water_depth(),
+            default_map, depthfile
+        )
+        constraint_list = ConstraintsListFactory.get_constraints_list(
+            constraints_string_list=config.CONSTRAINTS_LIST, 
+            data_mode=config._DATA_MODE_DEPTH,
+            min_depth=boat.get_required_water_depth(),
+            map_size=default_map, depthfile=depthfile, 
+            waypoints=config.INTERMEDIATE_WAYPOINTS,
+            courses_path=config.COURSES_FILE
+        )
+        
+        # Initialize and run routing algorithm
+        alg = RoutingAlgFactory.get_routing_alg(config)
+        alg.init_fig(water_depth=water_depth, map_size=default_map)
+        
+        min_fuel_route, error_code = alg.execute_routing(boat, wt, constraint_list)
+        
+        # Check for routing errors
+        if error_code != 0:
+            error_msg = f"Routing algorithm returned error code {error_code}"
+            if hasattr(min_fuel_route, 'route_type') and 'failed' in str(min_fuel_route.route_type):
+                error_msg = f"No valid route found (error {error_code})"
+            print(f"[WRT] {error_msg}", flush=True)
+            return {"success": False, "error": error_msg}
+        
+        min_fuel_route.write_to_geojson(routepath + '/' + str(min_fuel_route.route_type) + ".json")
+        
+        # Capture weather hazards report (always include if A* with avoidance enabled)
+        if hasattr(alg, 'get_weather_hazards'):
+            hazard_data = alg.get_weather_hazards()
+            weather_hazards = hazard_data  # Always include, even if empty
+            if hazard_data.get('hazards'):
+                print(f"[WRT] Weather hazards: {hazard_data['summary']}", flush=True)
+            else:
+                print(f"[WRT] No weather hazards detected (thresholds: {hazard_data.get('thresholds', {})})", flush=True)
         
         # Find output route
         output_path = Path(output_dir)
@@ -760,7 +961,11 @@ def run_wrt_direct(config_dict: dict, output_dir: str) -> dict:
                             "coords": coords  # Include coords for debugging
                         }
                     
-                    return {"success": True, "coords": coords}
+                    return {
+                        "success": True, 
+                        "coords": coords,
+                        "weather_hazards": weather_hazards
+                    }
             except Exception as e:
                 print(f"[WRT] Error parsing {route_file}: {e}", flush=True)
         
@@ -784,38 +989,63 @@ async def run_single_routing_pass(
     lat_min: float, lat_max: float,
     lon_min: float, lon_max: float,
     algorithm: str,
-    time_forecast_hours: Optional[int] = None
+    time_forecast_hours: Optional[int] = None,
+    route_distance_nm: Optional[float] = None,  # Pre-computed route distance
+    route_points: Optional[list] = None  # List of (lat, lon) for smart resolution
 ) -> dict:
     """
     Run a single WRT routing pass with specified weather source.
     Returns {"success": True, "coords": [...], "weather_cached": bool} or {"success": False, "error": "..."}
     
     Args:
-        time_forecast_hours: Override for TIME_FORECAST. If None, uses defaults (168 for calm, 144 for real weather).
-                            Tip: Use the calm route's estimated time to size this for real weather pass.
+        time_forecast_hours: Override for TIME_FORECAST. If None, auto-sizes based on route_distance_nm.
+        route_distance_nm: Pre-computed route distance in nautical miles. Used to auto-size time_forecast.
+                          For a 5000nm route at 10kts, creates ~750 hour forecast window.
+        route_points: List of (lat, lon) waypoints for smart resolution selection based on land proximity.
     """
     request_output_dir = f"{OUTPUT_DIR}/{pass_id}"
     Path(request_output_dir).mkdir(parents=True, exist_ok=True)
     
     # Determine time_forecast:
     # - If caller provided time_forecast_hours, use it
-    # - Otherwise use defaults: 168 for calm, 144 for real weather
+    # - Otherwise auto-size based on route distance at assumed 10 knots average
+    # - Add 50% safety margin for routing overhead
     if time_forecast_hours is not None:
         time_forecast = time_forecast_hours
-        print(f"[Weather:{pass_id}] Using caller-provided TIME_FORECAST: {time_forecast} hours", flush=True)
+        # Don't log here - the route endpoint already logs auto-sizing if applicable
+    elif route_distance_nm is not None and route_distance_nm > 0:
+        # Auto-size based on route distance: assume 10 knots average speed
+        # Add 50% margin for routing exploration, weather delays, etc.
+        estimated_hours = int(route_distance_nm / 10.0 * 1.5)
+        # Minimum 168 hours (7 days), round up to nearest 24 hours
+        time_forecast = max(168, ((estimated_hours + 23) // 24) * 24)
+        print(f"[Weather:{pass_id}] Auto-sized TIME_FORECAST: {time_forecast}h for {route_distance_nm:.0f}nm route", flush=True)
     elif weather_source == "real":
         time_forecast = 144  # 6 days to leave margin for WRT's internal validation
+        print(f"[Weather:{pass_id}] Using default TIME_FORECAST: {time_forecast} hours", flush=True)
     else:
         time_forecast = 168 if algorithm in ["genetic", "isofuel"] else 96
+        print(f"[Weather:{pass_id}] Using default TIME_FORECAST: {time_forecast} hours", flush=True)
     
     weather_time_hours = time_forecast + 12  # Buffer
     
     # Generate weather data
+    # For A* with calm weather, we can skip weather creation entirely - A* uses pure distance cost
     weather_cached = False
-    if weather_source == "calm":
+    weather_path = None
+    
+    if weather_source == "calm" and algorithm == "astar":
+        # A* with calm weather doesn't need weather data - uses pure geodesic distance
+        print(f"[Weather:{pass_id}] A* calm mode - skipping weather (pure distance cost)", flush=True)
+        weather_path = f"{DATA_DIR}/weather_dummy.nc"  # Placeholder path (won't be read)
+        # Create a minimal 1-hour dummy file if it doesn't exist
+        if not Path(weather_path).exists():
+            create_synthetic_weather(0, 1, 0, 1, 1.0, 1, weather_path, departure)
+        weather_cached = True
+    elif weather_source == "calm":
         print(f"[Weather:{pass_id}] Using calm synthetic data (no wind, 0.1m waves)", flush=True)
         weather_path = f"{DATA_DIR}/weather_{pass_id}.nc"
-        create_synthetic_weather(lat_min, lat_max, lon_min, lon_max, 1.0, weather_time_hours, weather_path)
+        create_synthetic_weather(lat_min, lat_max, lon_min, lon_max, 1.0, weather_time_hours, weather_path, departure)
         weather_cached = True
     else:  # "real"
         print(f"[Weather:{pass_id}] Fetching real weather from OpenMeteo...", flush=True)
@@ -901,23 +1131,46 @@ async def run_single_routing_pass(
         "DIJKSTRA_STEP": 1,                  # Keep all waypoints
         "DIJKSTRA_USE_WEATHER": weather_source == "real",  # Use weather for fuel costs when available
         
-        # A* algorithm settings - Full Western/Central Mediterranean at ~5km resolution
-        # Covers: Gibraltar to Albania, includes Malta, Corsica, Sardinia, Sicily
-        # Estimated: ~2.6M cells, ~35min initial build, ~2GB cache
-        "ASTAR_GRID_RESOLUTION": 0.05,       # ~5km resolution (0.05 degrees)
+        # A* algorithm settings
+        # Graph bounds are computed DYNAMICALLY from the route - no hard-coded limits!
+        # The router will expand/build graphs on-demand for any route worldwide.
+        # 
+        # SMART ADAPTIVE RESOLUTION based on route distance AND land proximity:
+        #   < 200nm     → 0.05° (~5km)   - Fine: Coastal, regional routes
+        #   200-1000nm  → 0.1° (~11km)   - Medium: Multi-day passages
+        #   1000-5000nm → 0.25° (~28km)  - Coarse: Transoceanic routes
+        #   > 5000nm    → 1.0° or 2.0°   - Based on land proximity:
+        #                  Near land/straits: 1.0° (need connectivity through straits)
+        #                  Open ocean only: 2.0° (can use coarse grid for speed)
+        "ASTAR_GRID_RESOLUTION": select_astar_resolution(route_distance_nm, route_points or []),
         "ASTAR_NOF_NEIGHBORS": 1,            # 8 neighbors per node
-        "ASTAR_LAND_CHECK_INTERVAL": 1000,   # Check every 1km for land crossings
+        "ASTAR_LAND_CHECK_INTERVAL": (       # Adaptive land check interval
+            1000 if route_distance_nm is None or route_distance_nm < 200 else
+            1000 if route_distance_nm < 1000 else
+            1000
+        ),
         "ASTAR_USE_WEATHER": weather_source == "real",  # Use weather for edge costs
-        "ASTAR_LAT_MIN": 34.0,               # Full Med region bounds
-        "ASTAR_LAT_MAX": 45.0,
-        "ASTAR_LON_MIN": 4.0,
-        "ASTAR_LON_MAX": 21.0,
+        # No ASTAR_LAT_MIN/MAX or ASTAR_LON_MIN/MAX - bounds are computed from route!
+        # Weather avoidance thresholds (only for real weather)
+        # Note: Using higher thresholds for POC; should be configurable via request
+        "ASTAR_MAX_WAVE_HEIGHT_M": 5.0 if weather_source == "real" else None,  # Avoid >5m waves
+        "ASTAR_MAX_WIND_SPEED_KTS": 50.0 if weather_source == "real" else None,  # Avoid >50kt wind (gale force)
+        "ASTAR_MAX_CURRENT_SPEED_KTS": 4.0 if weather_source == "real" else None,  # Avoid >4kt currents (strong tidal)
+        "ASTAR_WEATHER_PENALTY_FACTOR": 10.0,  # 10x cost penalty for hazardous edges
+        # Dynamic corridor - limits search to area around route for performance
+        "ASTAR_USE_CORRIDOR": True,          # Enable corridor filtering
+        "ASTAR_CORRIDOR_FRACTION": 0.3,      # 30% of route distance as corridor width
+        "ASTAR_CORRIDOR_MIN_KM": 100.0,      # Minimum 100km corridor for short routes
         
         "WEATHER_DATA": weather_path,
         "DEPTH_DATA": depth_path,
         "ROUTE_PATH": request_output_dir,
         "COURSES_FILE": request_output_dir,
     }
+    
+    # Log resolution being used
+    if algorithm == "astar" and route_distance_nm:
+        print(f"[WRT:{pass_id}] A* resolution: {config['ASTAR_GRID_RESOLUTION']:.2f}° for {route_distance_nm:.0f}nm route", flush=True)
     
     print(f"[WRT:{pass_id}] Running {algorithm} with {weather_source} weather...", flush=True)
     
@@ -934,7 +1187,8 @@ async def run_single_routing_pass(
         "success": True,
         "coords": result["coords"],
         "weather_cached": weather_cached,
-        "weather_source": weather_source
+        "weather_source": weather_source,
+        "weather_hazards": result.get("weather_hazards")
     }
 
 
@@ -969,6 +1223,13 @@ async def calculate_route(request: RouteRequest):
     
     print(f"\n{'='*60}", flush=True)
     print(f"[Route] New routing request", flush=True)
+    
+    # Debug: log full request JSON
+    if DEBUG_LOGGING:
+        request_dict = request.model_dump()
+        print(f"[DEBUG] Full request JSON:", flush=True)
+        print(json.dumps(request_dict, indent=2, default=str), flush=True)
+    
     print(f"[Route] Start: ({request.start.lat}, {request.start.lon})", flush=True)
     print(f"[Route] End: ({request.end.lat}, {request.end.lon})", flush=True)
     print(f"[Route] Waypoints: {len(request.waypoints or [])}", flush=True)
@@ -998,16 +1259,41 @@ async def calculate_route(request: RouteRequest):
     lon_min = min(all_lons) - 2
     lon_max = max(all_lons) + 2
     
+    # Estimate great circle distance for adaptive resolution
+    # Include waypoints in distance calculation
+    route_points = [(request.start.lat, request.start.lon)] + \
+                   [(wp.lat, wp.lon) for wp in (request.waypoints or [])] + \
+                   [(request.end.lat, request.end.lon)]
+    gc_distance_nm = 0.0
+    for i in range(len(route_points) - 1):
+        gc_distance_nm += calculate_distance_nm(
+            route_points[i][0], route_points[i][1],
+            route_points[i+1][0], route_points[i+1][1]
+        )
+    
+    # Smart resolution selection based on distance AND land proximity
+    selected_resolution = select_astar_resolution(gc_distance_nm, route_points)
+    near_land = route_passes_near_land(route_points)
+    
+    # Log resolution choice with reasoning
+    res_labels = {0.05: "fine (0.05°, ~5km)", 0.1: "medium (0.1°, ~11km)", 
+                  0.25: "coarse (0.25°, ~28km)", 1.0: "very coarse (1.0°, ~111km)",
+                  2.0: "ultra coarse (2.0°, ~222km)"}
+    res_label = res_labels.get(selected_resolution, f"{selected_resolution}°")
+    land_note = " [near land - using finer grid]" if gc_distance_nm >= 5000 and near_land else ""
+    land_note = " [open ocean - using coarse grid]" if gc_distance_nm >= 5000 and not near_land else land_note
+    print(f"[Route] Great circle distance: {gc_distance_nm:.1f} nm → {res_label} resolution{land_note}", flush=True)
+    
     request_id = hashlib.md5(f"{request.start.lat}{request.start.lon}{request.end.lat}{request.end.lon}{time.time()}".encode()).hexdigest()[:8]
     
     # Algorithm selection (default: astar for reliable land avoidance + weather)
     algorithm = request.algorithm or "astar"
     if algorithm not in ["isofuel", "genetic", "gcrslider", "greedy", "dijkstra", "astar"]:
-        return RouteResponse(
+        return debug_log_response(RouteResponse(
             success=False,
             error=f"Unknown algorithm: {algorithm}. Options: isofuel, genetic, gcrslider, greedy, dijkstra, astar",
             execution_time_ms=(time.time() - start_time) * 1000
-        )
+        ))
     
     # Validate waypoint support
     algorithms_with_waypoint_support = ["isofuel", "greedy", "astar"]
@@ -1036,15 +1322,17 @@ async def calculate_route(request: RouteRequest):
         lat_min=lat_min, lat_max=lat_max,
         lon_min=lon_min, lon_max=lon_max,
         algorithm=algorithm,
-        time_forecast_hours=request.time_forecast_hours
+        time_forecast_hours=request.time_forecast_hours,
+        route_distance_nm=gc_distance_nm,
+        route_points=route_points
     )
     
     if not calm_result.get("success"):
-        return RouteResponse(
+        return debug_log_response(RouteResponse(
             success=False,
             error=f"Calm weather routing failed: {calm_result.get('error')}",
             execution_time_ms=(time.time() - start_time) * 1000
-        )
+        ))
     
     calm_coords = calm_result["coords"]
     calm_distance = calculate_route_distance(calm_coords)
@@ -1066,7 +1354,7 @@ async def calculate_route(request: RouteRequest):
         print(f"[Route] Calm weather route: {calm_distance:.1f}nm", flush=True)
         print(f"{'='*60}\n", flush=True)
         
-        return RouteResponse(
+        return debug_log_response(RouteResponse(
             success=True,
             route=calm_route,
             optimized_route=None,  # No optimization requested
@@ -1075,7 +1363,7 @@ async def calculate_route(request: RouteRequest):
             weather_cached=True,
             algorithm_used=algorithm,
             weather_source_used="calm"
-        )
+        ))
     
     # Weather optimization mode: run second pass with real weather
     print(f"\n--- PASS 2: Real weather optimization ---", flush=True)
@@ -1098,14 +1386,16 @@ async def calculate_route(request: RouteRequest):
         lat_min=lat_min, lat_max=lat_max,
         lon_min=lon_min, lon_max=lon_max,
         algorithm=algorithm,
-        time_forecast_hours=real_weather_forecast_hours
+        time_forecast_hours=real_weather_forecast_hours,
+        route_distance_nm=gc_distance_nm,
+        route_points=route_points
     )
     
     if not real_result.get("success"):
         # If real weather fails, return calm route with error note
         exec_time = (time.time() - start_time) * 1000
         print(f"[Route] Real weather routing failed, returning calm route only", flush=True)
-        return RouteResponse(
+        return debug_log_response(RouteResponse(
             success=True,
             route=calm_route,
             optimized_route=None,
@@ -1114,7 +1404,7 @@ async def calculate_route(request: RouteRequest):
             weather_cached=True,
             algorithm_used=algorithm,
             weather_source_used="calm (real weather fetch failed)"
-        )
+        ))
     
     real_coords = real_result["coords"]
     real_distance = calculate_route_distance(real_coords)
@@ -1133,7 +1423,18 @@ async def calculate_route(request: RouteRequest):
     print(f"[Route] Difference: {real_distance - calm_distance:+.1f}nm", flush=True)
     print(f"{'='*60}\n", flush=True)
     
-    return RouteResponse(
+    # Build weather hazard report if available
+    weather_hazard_report = None
+    raw_hazards = real_result.get("weather_hazards")
+    if raw_hazards:
+        weather_hazard_report = WeatherHazardReport(
+            hazards=[WeatherHazard(**h) for h in raw_hazards.get("hazards", [])],
+            summary=WeatherHazardSummary(**raw_hazards.get("summary", {})),
+            thresholds=raw_hazards.get("thresholds", {})
+        )
+        print(f"[Route] Weather hazards: {raw_hazards['summary']}", flush=True)
+    
+    return debug_log_response(RouteResponse(
         success=True,
         route=calm_route,              # Baseline with calm weather
         optimized_route=optimized_route,  # Optimized with real weather
@@ -1141,8 +1442,9 @@ async def calculate_route(request: RouteRequest):
         execution_time_ms=exec_time,
         weather_cached=real_result.get("weather_cached", False),
         algorithm_used=algorithm,
-        weather_source_used="calm vs real"
-    )
+        weather_source_used="calm vs real",
+        weather_hazards=weather_hazard_report
+    ))
 
 
 @app.delete("/cache")

@@ -90,10 +90,14 @@ class Config(BaseModel):
     ASTAR_NOF_NEIGHBORS: int = 1  # Number of neighbor rings (1=8 neighbors, 2=24 neighbors)
     ASTAR_LAND_CHECK_INTERVAL: int = 1000  # Interval in meters for land crossing checks
     ASTAR_USE_WEATHER: bool = True  # Whether to use weather for edge costs
-    ASTAR_LAT_MIN: float = None  # Region bounds (None = use map bounds)
-    ASTAR_LAT_MAX: float = None
-    ASTAR_LON_MIN: float = None
-    ASTAR_LON_MAX: float = None
+    ASTAR_LAT_MIN: Optional[float] = None  # Region bounds (None = use map bounds)
+    ASTAR_LAT_MAX: Optional[float] = None
+    ASTAR_LON_MIN: Optional[float] = None
+    ASTAR_LON_MAX: Optional[float] = None
+    # Weather avoidance thresholds
+    ASTAR_MAX_WAVE_HEIGHT_M: Optional[float] = None  # Max significant wave height (None = no avoidance)
+    ASTAR_MAX_WIND_SPEED_KTS: Optional[float] = None  # Max wind speed in knots (None = no avoidance)
+    ASTAR_WEATHER_PENALTY_FACTOR: float = 10.0  # Cost multiplier for hazardous edges
 
     # options for GCR Slider algorithm
     GCR_SLIDER_ANGLE_STEP: float = 30  # in degrees
@@ -393,8 +397,11 @@ class Config(BaseModel):
         :return: Config object with validated WEATHER_DATA regarding place and time
         :rtype: WeatherRoutingTool.config.Config
         """
-        # The Dijkstra algorithm does not consider weather data at the moment
+        # Skip weather validation for algorithms that don't use weather data
         if self.ALGORITHM_TYPE in ['dijkstra', 'gcr_slider']:
+            return self
+        # A* also skips weather when ASTAR_USE_WEATHER is False
+        if self.ALGORITHM_TYPE == 'astar' and not getattr(self, 'ASTAR_USE_WEATHER', True):
             return self
         path = Path(self.WEATHER_DATA)
         if path.exists():

@@ -522,5 +522,497 @@ class TestAStarHelpers:
         assert lon_grid[lon_idx] == test_lon
 
 
+# =============================================================================
+# WEATHER AVOIDANCE TESTS
+# =============================================================================
+
+class TestAStarWeatherAvoidance:
+    """Tests for A* weather avoidance functionality."""
+    
+    @pytest.fixture
+    def mock_router_with_avoidance(self, temp_cache_dir):
+        """Create a mocked A* router with weather avoidance enabled."""
+        with patch('WeatherRoutingTool.algorithms.astar_router.GRAPH_CACHE_DIR', temp_cache_dir):
+            from WeatherRoutingTool.algorithms.astar_router import AStarRouter
+            
+            # Config with weather avoidance thresholds
+            class AvoidanceConfig(MockConfig):
+                def __init__(self):
+                    super().__init__()
+                    self.ASTAR_MAX_WAVE_HEIGHT_M = 3.0
+                    self.ASTAR_MAX_WIND_SPEED_KTS = 25.0
+                    self.ASTAR_WEATHER_PENALTY_FACTOR = 10.0
+                    self.ASTAR_USE_WEATHER = True
+            
+            with patch.object(AStarRouter, '__init__', lambda self, cfg: None):
+                router = AStarRouter.__new__(AStarRouter)
+                router.config = AvoidanceConfig()
+                router.grid_resolution = 0.5
+                router.lat_min = 38.0
+                router.lat_max = 40.0
+                router.lon_min = 7.0
+                router.lon_max = 9.0
+                router.nof_neighbors = 1
+                router.land_check_interval = 1000
+                router.land_polygon_detector = None
+                router.graph = None
+                router.lat_grid = np.arange(38.0, 40.0, 0.5)
+                router.lon_grid = np.arange(7.0, 9.0, 0.5)
+                router.map_ext = MockMapExt()
+                router.use_weather = True
+                router.weather = None
+                router.boat = None
+                router._wind_cache = None
+                router._wind_cache_time = None
+                router.departure_time = datetime.now()
+                
+                # Weather avoidance attributes
+                router.max_wave_height_m = 3.0
+                router.max_wind_speed_kts = 25.0
+                router.max_current_speed_kts = 4.0
+                router.weather_penalty_factor = 10.0
+                router._hazardous_nodes = set()
+                router._hazards_encountered = []
+                
+                yield router
+    
+    @pytest.fixture
+    def temp_cache_dir(self):
+        """Create a temporary cache directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+    
+    def test_get_weather_at_node_returns_wind_speed(self, mock_router_with_avoidance):
+        """Test that _get_weather_at_node returns wind speed in knots."""
+        router = mock_router_with_avoidance
+        
+        # Mock _get_wind and _get_current to return specific values
+        with patch.object(router, '_get_wind', return_value=(5.0, 5.0)):  # ~7.07 m/s
+            with patch.object(router, '_get_current', return_value=(0.0, 0.0)):  # No current
+                weather = router._get_weather_at_node(39.0, 8.0, datetime.now())
+                
+                # sqrt(5^2 + 5^2) = 7.07 m/s * 1.94384 = ~13.7 knots
+                assert 'wind_speed_kts' in weather
+                assert abs(weather['wind_speed_kts'] - 13.74) < 0.1
+    
+    def test_node_not_hazardous_when_below_threshold(self, mock_router_with_avoidance):
+        """Test that nodes below thresholds are not marked hazardous."""
+        router = mock_router_with_avoidance
+        
+        # Mock wind to be below threshold (25 kts)
+        # 10 kts = 5.14 m/s; need u,v such that sqrt(u^2+v^2)=5.14
+        with patch.object(router, '_get_wind', return_value=(3.64, 3.64)):  # ~10 kts
+            with patch.object(router, '_get_current', return_value=(0.0, 0.0)):  # No current
+                is_hazardous, _ = router._is_node_hazardous(39.0, 8.0, datetime.now())
+                assert not is_hazardous
+    
+    def test_node_hazardous_when_wind_exceeds_threshold(self, mock_router_with_avoidance):
+        """Test that nodes with high wind are marked hazardous."""
+        router = mock_router_with_avoidance
+        
+        # 30 kts = 15.4 m/s; need u,v such that sqrt(u^2+v^2)=15.4
+        with patch.object(router, '_get_wind', return_value=(10.9, 10.9)):  # ~30 kts
+            with patch.object(router, '_get_current', return_value=(0.0, 0.0)):  # No current
+                is_hazardous, weather = router._is_node_hazardous(39.0, 8.0, datetime.now())
+                assert is_hazardous
+                assert weather['wind_speed_kts'] > router.max_wind_speed_kts
+    
+    def test_node_hazardous_when_waves_exceed_threshold(self, mock_router_with_avoidance):
+        """Test that nodes with high waves are marked hazardous."""
+        router = mock_router_with_avoidance
+        
+        # Low wind but high waves
+        def mock_get_weather(lat, lon, time):
+            return {'wind_speed_kts': 10.0, 'wave_height_m': 4.5, 'current_speed_kts': None}  # > 3.0m threshold
+        
+        with patch.object(router, '_get_weather_at_node', mock_get_weather):
+            is_hazardous, weather = router._is_node_hazardous(39.0, 8.0, datetime.now())
+            assert is_hazardous
+    
+    def test_no_avoidance_when_thresholds_none(self, temp_cache_dir):
+        """Test that no nodes are hazardous when thresholds are not set."""
+        with patch('WeatherRoutingTool.algorithms.astar_router.GRAPH_CACHE_DIR', temp_cache_dir):
+            from WeatherRoutingTool.algorithms.astar_router import AStarRouter
+            
+            with patch.object(AStarRouter, '__init__', lambda self, cfg: None):
+                router = AStarRouter.__new__(AStarRouter)
+                router.max_wave_height_m = None
+                router.max_wind_speed_kts = None
+                router.max_current_speed_kts = None
+                router._hazardous_nodes = set()
+                
+                is_hazardous, _ = router._is_node_hazardous(39.0, 8.0, datetime.now())
+                assert not is_hazardous
+    
+    def test_hazard_report_structure(self, mock_router_with_avoidance):
+        """Test that get_weather_hazards returns correct structure."""
+        router = mock_router_with_avoidance
+        
+        # Simulate some hazards
+        router._hazards_encountered = [
+            {'lat': 39.0, 'lon': 8.0, 'wind_speed_kts': 30, 'wave_height_m': 2.0, 'status': 'avoided'},
+            {'lat': 39.5, 'lon': 8.5, 'wind_speed_kts': 28, 'wave_height_m': 3.5, 'status': 'traversed', 'reason': 'mandatory_waypoint'},
+        ]
+        
+        report = router.get_weather_hazards()
+        
+        assert 'hazards' in report
+        assert 'summary' in report
+        assert 'thresholds' in report
+        
+        assert report['summary']['hazards_detected'] == 2
+        assert report['summary']['hazards_avoided'] == 1
+        assert report['summary']['hazards_traversed'] == 1
+        
+        assert report['thresholds']['max_wave_height_m'] == 3.0
+        assert report['thresholds']['max_wind_speed_kts'] == 25.0
+        assert report['thresholds']['max_current_speed_kts'] == 4.0
+    
+    def test_hazard_tracking_during_edge_cost(self, mock_router_with_avoidance):
+        """Test that hazardous nodes are tracked during edge cost calculation."""
+        router = mock_router_with_avoidance
+        router.weather = MagicMock()
+        router.weather.ds = None  # Force fallback
+        router.boat = MagicMock()
+        router.boat.get_boat_speed.return_value = MagicMock(value=7.2)
+        
+        # Reset tracking
+        router._hazardous_nodes = set()
+        
+        # Mock to return hazardous conditions
+        def mock_is_hazardous(lat, lon, time):
+            return True, {'wind_speed_kts': 30, 'wave_height_m': None}
+        
+        with patch.object(router, '_is_node_hazardous', mock_is_hazardous):
+            with patch.object(router, '_get_wind', return_value=(0.0, 0.0)):
+                # Calculate edge cost
+                edge_data = {'distance': 5000}
+                cost = router._compute_edge_weight(
+                    (38.5, 7.5), (39.0, 8.0), edge_data, datetime.now()
+                )
+                
+                # Should have tracked the hazardous node
+                assert len(router._hazardous_nodes) == 1
+                
+                # Cost should be penalized
+                base_cost = 5000 / 7.2  # distance / speed
+                expected_penalty = base_cost * router.weather_penalty_factor
+                assert cost == pytest.approx(expected_penalty, rel=0.1)
+
+    def test_get_weather_at_node_returns_current_speed(self, mock_router_with_avoidance):
+        """Test that _get_weather_at_node returns current speed in knots."""
+        router = mock_router_with_avoidance
+        
+        # Mock _get_wind and _get_current to return specific values
+        with patch.object(router, '_get_wind', return_value=(5.0, 5.0)):
+            with patch.object(router, '_get_current', return_value=(0.5, 0.5)):  # ~0.71 m/s
+                weather = router._get_weather_at_node(39.0, 8.0, datetime.now())
+                
+                # sqrt(0.5^2 + 0.5^2) = 0.707 m/s * 1.94384 = ~1.37 knots
+                assert 'current_speed_kts' in weather
+                assert abs(weather['current_speed_kts'] - 1.37) < 0.1
+
+    def test_node_hazardous_when_current_exceeds_threshold(self, mock_router_with_avoidance):
+        """Test that nodes with strong current are marked hazardous."""
+        router = mock_router_with_avoidance
+        router.max_current_speed_kts = 3.0  # Lower threshold for test
+        
+        # Strong current: 5 kts = 2.57 m/s; need uo,vo such that sqrt(uo^2+vo^2)=2.57
+        # But we mock the weather response directly
+        def mock_get_weather(lat, lon, time):
+            return {'wind_speed_kts': 10.0, 'wave_height_m': None, 'current_speed_kts': 5.0}
+        
+        with patch.object(router, '_get_weather_at_node', mock_get_weather):
+            is_hazardous, weather = router._is_node_hazardous(39.0, 8.0, datetime.now())
+            assert is_hazardous
+
+    def test_favorable_current_reduces_edge_cost(self, mock_router_with_avoidance):
+        """Test that current in the direction of travel reduces edge cost."""
+        router = mock_router_with_avoidance
+        router.weather = MagicMock()
+        router.weather.ds = None
+        router.boat = MagicMock()
+        router.boat.get_boat_speed.return_value = MagicMock(value=7.2)  # ~14 knots
+        
+        edge_data = {'distance': 10000}  # 10km
+        
+        # Heading: northeast (~45 degrees), Current: also NE (favorable)
+        # For a heading of ~45 degrees, a favorable current would be uo=0.5, vo=0.5
+        with patch.object(router, '_get_wind', return_value=(0.0, 0.0)):  # No wind
+            with patch.object(router, '_get_current', return_value=(0.5, 0.5)):  # ~0.7m/s NE current
+                with patch.object(router, '_is_node_hazardous', return_value=(False, {})):
+                    cost_with_current = router._compute_edge_weight(
+                        (39.0, 8.0), (39.5, 8.5), edge_data, datetime.now()
+                    )
+        
+        with patch.object(router, '_get_wind', return_value=(0.0, 0.0)):
+            with patch.object(router, '_get_current', return_value=(0.0, 0.0)):  # No current
+                with patch.object(router, '_is_node_hazardous', return_value=(False, {})):
+                    cost_no_current = router._compute_edge_weight(
+                        (39.0, 8.0), (39.5, 8.5), edge_data, datetime.now()
+                    )
+        
+        # Favorable current should reduce cost (faster)
+        assert cost_with_current < cost_no_current
+
+    def test_opposing_current_increases_edge_cost(self, mock_router_with_avoidance):
+        """Test that current against the direction of travel increases edge cost."""
+        router = mock_router_with_avoidance
+        router.weather = MagicMock()
+        router.weather.ds = None
+        router.boat = MagicMock()
+        router.boat.get_boat_speed.return_value = MagicMock(value=7.2)  # ~14 knots
+        
+        edge_data = {'distance': 10000}  # 10km
+        
+        # Heading: northeast (~45 degrees), Current: SW (opposing)
+        with patch.object(router, '_get_wind', return_value=(0.0, 0.0)):
+            with patch.object(router, '_get_current', return_value=(-0.5, -0.5)):  # SW current
+                with patch.object(router, '_is_node_hazardous', return_value=(False, {})):
+                    cost_opposing_current = router._compute_edge_weight(
+                        (39.0, 8.0), (39.5, 8.5), edge_data, datetime.now()
+                    )
+        
+        with patch.object(router, '_get_wind', return_value=(0.0, 0.0)):
+            with patch.object(router, '_get_current', return_value=(0.0, 0.0)):  # No current
+                with patch.object(router, '_is_node_hazardous', return_value=(False, {})):
+                    cost_no_current = router._compute_edge_weight(
+                        (39.0, 8.0), (39.5, 8.5), edge_data, datetime.now()
+                    )
+        
+        # Opposing current should increase cost (slower)
+        assert cost_opposing_current > cost_no_current
+
+
+# =============================================================================
+# CORRIDOR AND DYNAMIC BOUNDS TESTS
+# =============================================================================
+
+class TestAStarCorridor:
+    """Tests for A* corridor filtering and dynamic bounds expansion."""
+    
+    @pytest.fixture
+    def mock_router_with_corridor(self, temp_cache_dir):
+        """Create a router with corridor settings."""
+        with patch('WeatherRoutingTool.algorithms.astar_router.GRAPH_CACHE_DIR', temp_cache_dir):
+            from WeatherRoutingTool.algorithms.astar_router import AStarRouter
+            
+            with patch.object(AStarRouter, '__init__', lambda self, cfg: None):
+                router = AStarRouter.__new__(AStarRouter)
+                router.config = MagicMock()
+                router.grid_resolution = 0.1
+                router.nof_neighbors = 1
+                router.land_check_interval = 1000
+                router.use_weather = True
+                router.lat_min = 38.0
+                router.lat_max = 44.0
+                router.lon_min = 7.0
+                router.lon_max = 11.0
+                router.map_ext = MockMapExt(38.0, 44.0, 7.0, 11.0)
+                router.start = (41.9, 8.7)
+                router.finish = (42.5, 9.5)
+                router.departure_time = datetime.now()
+                router.graph = None
+                router.lat_grid = None
+                router.lon_grid = None
+                router.land_polygon_detector = None
+                router._wind_cache = None
+                router._wind_cache_time = None
+                router.max_wave_height_m = None
+                router.max_wind_speed_kts = None
+                router.weather_penalty_factor = 10.0
+                # Corridor settings
+                router.use_corridor = True
+                router.corridor_fraction = 0.3
+                router.corridor_min_km = 100.0
+                router._hazardous_nodes = set()
+                router._hazards_encountered = []
+                
+                yield router
+    
+    @pytest.fixture
+    def temp_cache_dir(self):
+        """Create a temporary cache directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+    
+    def test_corridor_bounds_computed_from_route(self, mock_router_with_corridor):
+        """Test that corridor bounds are correctly computed from start/end points."""
+        router = mock_router_with_corridor
+        
+        start = (41.9, 8.7)
+        end = (42.5, 9.5)
+        
+        bounds = router._compute_corridor_bounds(start, end)
+        lat_min, lat_max, lon_min, lon_max = bounds
+        
+        # Bounds should contain start and end points
+        assert lat_min < start[0] < lat_max
+        assert lat_min < end[0] < lat_max
+        assert lon_min < start[1] < lon_max
+        assert lon_min < end[1] < lon_max
+    
+    def test_corridor_width_respects_minimum(self, mock_router_with_corridor):
+        """Test that corridor width is at least corridor_min_km."""
+        router = mock_router_with_corridor
+        router.corridor_min_km = 100.0  # 100km minimum
+        
+        # Short route - should use minimum corridor width
+        start = (42.0, 9.0)
+        end = (42.1, 9.1)  # ~15km route
+        
+        bounds = router._compute_corridor_bounds(start, end)
+        lat_min, lat_max, lon_min, lon_max = bounds
+        
+        # Width should be at least ~100km (roughly 0.9 degrees at this latitude)
+        lat_width = lat_max - lat_min
+        assert lat_width >= 1.5  # 100km ≈ 0.9 deg, with padding both sides ≈ 1.8 deg
+    
+    def test_corridor_width_scales_with_route_length(self, mock_router_with_corridor):
+        """Test that corridor width scales with route distance for long routes."""
+        router = mock_router_with_corridor
+        router.corridor_fraction = 0.3
+        router.corridor_min_km = 50.0  # Low minimum
+        
+        # Long route (~500km)
+        start = (38.0, 7.0)
+        end = (42.0, 12.0)
+        
+        bounds = router._compute_corridor_bounds(start, end)
+        lat_min, lat_max, lon_min, lon_max = bounds
+        
+        # Width should be substantial for a 500km route
+        lat_width = lat_max - lat_min
+        assert lat_width > 5.0  # Should be at least 5 degrees for ~500km route
+    
+    def test_corridor_includes_waypoints(self, mock_router_with_corridor):
+        """Test that corridor bounds include intermediate waypoints."""
+        router = mock_router_with_corridor
+        
+        start = (41.0, 8.0)
+        end = (43.0, 10.0)
+        waypoints = [(42.0, 11.0)]  # Waypoint east of direct line
+        
+        bounds = router._compute_corridor_bounds(start, end, waypoints)
+        lat_min, lat_max, lon_min, lon_max = bounds
+        
+        # Bounds should contain the waypoint
+        wp_lat, wp_lon = waypoints[0]
+        assert lat_min < wp_lat < lat_max
+        assert lon_min < wp_lon < lon_max
+
+
+class TestAStarDynamicBounds:
+    """Tests for A* dynamic graph expansion."""
+    
+    @pytest.fixture
+    def temp_cache_dir(self):
+        """Create a temporary cache directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+    
+    @pytest.fixture
+    def mock_router_for_expansion(self, temp_cache_dir):
+        """Create a router for testing dynamic expansion."""
+        with patch('WeatherRoutingTool.algorithms.astar_router.GRAPH_CACHE_DIR', temp_cache_dir):
+            from WeatherRoutingTool.algorithms.astar_router import AStarRouter
+            
+            with patch.object(AStarRouter, '__init__', lambda self, cfg: None):
+                router = AStarRouter.__new__(AStarRouter)
+                router.config = MagicMock()
+                router.grid_resolution = 0.5  # Coarse for fast tests
+                router.nof_neighbors = 1
+                router.land_check_interval = 1000
+                router.use_weather = False
+                # Initial small bounds
+                router.lat_min = 40.0
+                router.lat_max = 42.0
+                router.lon_min = 8.0
+                router.lon_max = 10.0
+                router.map_ext = MockMapExt(40.0, 42.0, 8.0, 10.0)
+                router.start = (41.0, 9.0)
+                router.finish = (41.5, 9.5)
+                router.departure_time = datetime.now()
+                router.graph = MagicMock()  # Pretend graph exists
+                router.graph.number_of_nodes.return_value = 100
+                router.lat_grid = np.arange(40.0, 42.0, 0.5)
+                router.lon_grid = np.arange(8.0, 10.0, 0.5)
+                router.land_polygon_detector = None
+                router._wind_cache = None
+                router._wind_cache_time = None
+                router.max_wave_height_m = None
+                router.max_wind_speed_kts = None
+                router.weather_penalty_factor = 10.0
+                router.use_corridor = True
+                router.corridor_fraction = 0.3
+                router.corridor_min_km = 100.0
+                router._hazardous_nodes = set()
+                router._hazards_encountered = []
+                
+                yield router
+    
+    def test_graph_covers_route_returns_false_when_covered(self, mock_router_for_expansion):
+        """Test that _ensure_graph_covers_route returns False when route is within bounds."""
+        router = mock_router_for_expansion
+        # Set large initial bounds that will cover corridor
+        router.lat_min = 35.0
+        router.lat_max = 48.0
+        router.lon_min = 4.0
+        router.lon_max = 14.0
+        
+        # Route well within current bounds with corridor padding
+        start = (40.5, 8.5)
+        end = (41.5, 9.5)
+        
+        # Mock _load_or_build_graph to track if called
+        router._load_or_build_graph = MagicMock()
+        
+        result = router._ensure_graph_covers_route(start, end)
+        
+        # Should return False (no expansion needed)
+        assert result == False
+    
+    def test_graph_expansion_needed_when_outside_bounds(self, mock_router_for_expansion):
+        """Test that expansion is triggered when route is outside current bounds."""
+        router = mock_router_for_expansion
+        
+        # Route outside current bounds (needs latitude expansion)
+        start = (38.0, 9.0)  # Below lat_min of 40.0
+        end = (41.0, 9.5)
+        
+        # Track if _load_or_build_graph is called
+        build_called = []
+        def mock_build():
+            build_called.append(True)
+            router.graph = MagicMock()
+            router.lat_grid = np.arange(router.lat_min, router.lat_max, router.grid_resolution)
+            router.lon_grid = np.arange(router.lon_min, router.lon_max, router.grid_resolution)
+        router._load_or_build_graph = mock_build
+        
+        result = router._ensure_graph_covers_route(start, end)
+        
+        # Should return True (expansion happened)
+        assert result == True
+        # New bounds should include the route
+        assert router.lat_min <= 38.0
+    
+    def test_bounds_rounded_for_cache_reuse(self, mock_router_for_expansion):
+        """Test that expanded bounds are rounded to nice values for cache reuse."""
+        router = mock_router_for_expansion
+        
+        # Route that requires specific bounds
+        start = (38.7, 8.3)
+        end = (41.2, 9.7)
+        
+        router._load_or_build_graph = MagicMock()
+        router._ensure_graph_covers_route(start, end)
+        
+        # Bounds should be rounded to 0.5 degree increments
+        assert router.lat_min % 0.5 == 0
+        assert router.lat_max % 0.5 == 0
+        assert router.lon_min % 0.5 == 0
+        assert router.lon_max % 0.5 == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
