@@ -28,7 +28,7 @@ import time
 import asyncio
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor
 
 # Add WRT to path
@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 import requests
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 # WRT imports
@@ -265,6 +266,329 @@ def cleanup_stale_cache():
     if removed > 0:
         print(f"[Cache] Cleaned up {removed} stale cache entries", flush=True)
     return removed
+
+
+# ============================================================
+# Corridor-Based Weather Fetching
+# ============================================================
+def generate_corridor_points(
+    waypoints: List[Tuple[float, float]],
+    corridor_width_km: float = 200.0,
+    point_spacing_km: float = 100.0,
+    weather_resolution: float = 1.0
+) -> Set[Tuple[float, float]]:
+    """
+    Generate weather grid points along a route corridor.
+    
+    Instead of fetching weather for the entire bounding box (which wastes API calls
+    on land areas and regions far from the route), this generates points:
+    1. Along the geodesic path between waypoints
+    2. With perpendicular offsets to create a corridor of specified width
+    
+    Args:
+        waypoints: List of (lat, lon) tuples defining the route
+        corridor_width_km: Width of corridor on each side of route (default 200km)
+        point_spacing_km: Spacing between points along route (default 100km)
+        weather_resolution: Resolution to snap points to (default 1.0°)
+        
+    Returns:
+        Set of (lat, lon) tuples for weather grid points (snapped to resolution)
+    """
+    from geographiclib.geodesic import Geodesic
+    geod = Geodesic.WGS84
+    
+    corridor_points = set()
+    
+    # Sample along each segment
+    for i in range(len(waypoints) - 1):
+        lat1, lon1 = waypoints[i]
+        lat2, lon2 = waypoints[i + 1]
+        
+        # Get geodesic line
+        line = geod.InverseLine(lat1, lon1, lat2, lon2)
+        segment_km = line.s13 / 1000.0
+        
+        # Sample points along segment
+        n_points = max(2, int(segment_km / point_spacing_km) + 1)
+        
+        for j in range(n_points):
+            # Position along geodesic
+            s = (line.s13 * j) / (n_points - 1) if n_points > 1 else 0
+            g = line.Position(s)
+            center_lat, center_lon = g['lat2'], g['lon2']
+            azimuth = g['azi2']  # Forward azimuth at this point
+            
+            # Add center point
+            snapped_lat = round(center_lat / weather_resolution) * weather_resolution
+            snapped_lon = round(center_lon / weather_resolution) * weather_resolution
+            corridor_points.add((snapped_lat, snapped_lon))
+            
+            # Add perpendicular offset points for corridor width
+            # Perpendicular azimuths: azimuth + 90° and azimuth - 90°
+            for offset_km in [corridor_width_km / 2, corridor_width_km]:
+                for perp_dir in [90, -90]:
+                    perp_az = (azimuth + perp_dir) % 360
+                    offset_point = geod.Direct(center_lat, center_lon, perp_az, offset_km * 1000)
+                    off_lat = round(offset_point['lat2'] / weather_resolution) * weather_resolution
+                    off_lon = round(offset_point['lon2'] / weather_resolution) * weather_resolution
+                    # Clamp latitude to valid range
+                    off_lat = max(-90, min(90, off_lat))
+                    corridor_points.add((off_lat, off_lon))
+    
+    return corridor_points
+
+
+def fetch_marine_corridor(
+    waypoints: List[Tuple[float, float]],
+    corridor_width_km: float = 200.0,
+    point_spacing_km: float = 100.0,
+    weather_resolution: float = 1.0,
+    forecast_days: int = 7,
+    map_bounds: Tuple[float, float, float, float] = None  # (lat_min, lon_min, lat_max, lon_max)
+) -> xr.Dataset:
+    """
+    Fetch weather data along a route corridor instead of a full bounding box.
+    
+    This is much more efficient for long routes that don't need weather data
+    for the entire rectangular bounding box (which would include land and
+    irrelevant ocean areas).
+    
+    Args:
+        waypoints: List of (lat, lon) tuples defining the route
+        corridor_width_km: Width of corridor on each side of route
+        point_spacing_km: Spacing between sample points along route
+        weather_resolution: Resolution for weather grid snapping
+        forecast_days: Number of forecast days to fetch
+        map_bounds: (lat_min, lon_min, lat_max, lon_max) for the full map region.
+                   The returned dataset will cover this region so WRT validation passes.
+        
+    Returns:
+        xarray Dataset with weather data for corridor points
+    """
+    import time as time_module
+    
+    # Generate corridor points
+    corridor_points = generate_corridor_points(
+        waypoints, corridor_width_km, point_spacing_km, weather_resolution
+    )
+    
+    # Filter to ocean points only (skip land)
+    from global_land_mask import globe
+    ocean_points = [(lat, lon) for lat, lon in corridor_points 
+                    if not globe.is_land(lat, lon)]
+    
+    print(f"[Weather] Corridor: {len(corridor_points)} grid points, {len(ocean_points)} ocean points", flush=True)
+    
+    if len(ocean_points) == 0:
+        raise ValueError("No ocean points found along route corridor")
+    
+    # Calculate bounding box for the dataset structure
+    lats_list = sorted(set(p[0] for p in ocean_points))
+    lons_list = sorted(set(p[1] for p in ocean_points))
+    
+    # Create a sparse set for quick lookup
+    ocean_points_set = set(ocean_points)
+    
+    marine_url = "https://marine-api.open-meteo.com/v1/marine"
+    weather_url = "https://api.open-meteo.com/v1/forecast"
+    
+    hourly_vars = [
+        "wave_height", "wave_direction", "wave_period",
+        "wind_wave_height", "wind_wave_direction", "wind_wave_period",
+        "swell_wave_height", "swell_wave_direction", "swell_wave_period"
+    ]
+    wind_vars = ["wind_speed_10m", "wind_direction_10m"]
+    
+    all_data = []
+    total_points = len(ocean_points)
+    current = 0
+    cached_count = 0
+    fetched_count = 0
+    start_time = time_module.time()
+    
+    for lat, lon in ocean_points:
+        current += 1
+        cache_key = get_cache_key(lat, lon, forecast_days)
+        cached = get_cached_response(cache_key)
+        
+        if cached:
+            all_data.append(cached)
+            cached_count += 1
+            continue
+        
+        fetched_count += 1
+        try:
+            marine_response = requests.get(marine_url, params={
+                "latitude": lat, "longitude": lon,
+                "hourly": ",".join(hourly_vars),
+                "forecast_days": forecast_days,
+                "timezone": "UTC"
+            }, timeout=30)
+            
+            wind_response = requests.get(weather_url, params={
+                "latitude": lat, "longitude": lon,
+                "hourly": ",".join(wind_vars),
+                "forecast_days": forecast_days,
+                "timezone": "UTC",
+                "wind_speed_unit": "ms"
+            }, timeout=30)
+            
+            marine_data = marine_response.json() if marine_response.ok else {}
+            wind_data = wind_response.json() if wind_response.ok else {}
+            
+            point_data = {
+                'lat': lat, 'lon': lon,
+                'marine': marine_data,
+                'wind': wind_data
+            }
+            all_data.append(point_data)
+            save_to_cache(cache_key, point_data)
+            
+            # Progress update every 50 points
+            if fetched_count % 50 == 0:
+                elapsed = time_module.time() - start_time
+                rate = fetched_count / elapsed if elapsed > 0 else 0
+                remaining = (total_points - current) / rate if rate > 0 else 0
+                print(f"[Weather] Fetched {current}/{total_points} ({cached_count} cached, {fetched_count} fetched, ~{remaining:.0f}s remaining)", flush=True)
+                
+        except Exception as e:
+            print(f"[Weather] Error at ({lat}, {lon}): {e}", flush=True)
+            all_data.append({'lat': lat, 'lon': lon, 'marine': {}, 'wind': {}})
+    
+    elapsed = time_module.time() - start_time
+    print(f"[Weather] Corridor fetch complete: {cached_count} cached, {fetched_count} fetched in {elapsed:.1f}s", flush=True)
+    
+    # Build xarray dataset from corridor points
+    # Use map_bounds if provided (for WRT validation), otherwise use corridor bounds
+    if map_bounds:
+        grid_lat_min, grid_lon_min, grid_lat_max, grid_lon_max = map_bounds
+        # Snap to weather resolution grid
+        grid_lat_min = np.floor(grid_lat_min / weather_resolution) * weather_resolution
+        grid_lat_max = np.ceil(grid_lat_max / weather_resolution) * weather_resolution
+        grid_lon_min = np.floor(grid_lon_min / weather_resolution) * weather_resolution
+        grid_lon_max = np.ceil(grid_lon_max / weather_resolution) * weather_resolution
+    else:
+        grid_lat_min, grid_lat_max = min(lats_list), max(lats_list)
+        grid_lon_min, grid_lon_max = min(lons_list), max(lons_list)
+    
+    lats = np.arange(grid_lat_min, grid_lat_max + weather_resolution, weather_resolution)
+    lons = np.arange(grid_lon_min, grid_lon_max + weather_resolution, weather_resolution)
+    
+    # Get time axis from first valid response
+    times = None
+    for d in all_data:
+        if 'marine' in d and 'hourly' in d['marine'] and 'time' in d['marine']['hourly']:
+            times = pd.to_datetime(d['marine']['hourly']['time'])
+            break
+        if 'wind' in d and 'hourly' in d['wind'] and 'time' in d['wind']['hourly']:
+            times = pd.to_datetime(d['wind']['hourly']['time'])
+            break
+    
+    if times is None:
+        # Fallback: create time array
+        times = pd.date_range(start=pd.Timestamp.now(tz='UTC').floor('H'), 
+                             periods=forecast_days * 24, freq='h')
+    
+    n_times = len(times)
+    n_lats = len(lats)
+    n_lons = len(lons)
+    
+    # Initialize arrays with NaN (will be filled where we have data)
+    wave_height = np.full((n_times, n_lats, n_lons), np.nan)
+    wave_dir = np.full((n_times, n_lats, n_lons), np.nan)
+    wave_period = np.full((n_times, n_lats, n_lons), np.nan)
+    wind_speed = np.full((n_times, n_lats, n_lons), np.nan)
+    wind_dir = np.full((n_times, n_lats, n_lons), np.nan)
+    
+    # Fill in data from corridor points
+    for point_data in all_data:
+        lat, lon = point_data['lat'], point_data['lon']
+        lat_idx = int(round((lat - lats[0]) / weather_resolution))
+        lon_idx = int(round((lon - lons[0]) / weather_resolution))
+        
+        if 0 <= lat_idx < n_lats and 0 <= lon_idx < n_lons:
+            marine = point_data.get('marine', {})
+            wind = point_data.get('wind', {})
+            
+            if 'hourly' in marine:
+                hourly = marine['hourly']
+                if 'wave_height' in hourly and hourly['wave_height']:
+                    data = np.array(hourly['wave_height'][:n_times], dtype=float)
+                    data = np.where(np.isnan(data), 0.5, data)
+                    wave_height[:len(data), lat_idx, lon_idx] = data
+                if 'wave_direction' in hourly and hourly['wave_direction']:
+                    data = np.array(hourly['wave_direction'][:n_times], dtype=float)
+                    data = np.where(np.isnan(data), 0.0, data)
+                    wave_dir[:len(data), lat_idx, lon_idx] = data
+                if 'wave_period' in hourly and hourly['wave_period']:
+                    data = np.array(hourly['wave_period'][:n_times], dtype=float)
+                    data = np.where(np.isnan(data), 6.0, data)
+                    wave_period[:len(data), lat_idx, lon_idx] = data
+            
+            if 'hourly' in wind:
+                hourly = wind['hourly']
+                if 'wind_speed_10m' in hourly and hourly['wind_speed_10m']:
+                    data = np.array(hourly['wind_speed_10m'][:n_times], dtype=float)
+                    data = np.where(np.isnan(data), 5.0, data)
+                    wind_speed[:len(data), lat_idx, lon_idx] = data
+                if 'wind_direction_10m' in hourly and hourly['wind_direction_10m']:
+                    data = np.array(hourly['wind_direction_10m'][:n_times], dtype=float)
+                    data = np.where(np.isnan(data), 0.0, data)
+                    wind_dir[:len(data), lat_idx, lon_idx] = data
+    
+    # Fill NaN values with defaults (for grid cells not in corridor)
+    wave_height = np.where(np.isnan(wave_height), 1.0, wave_height)
+    wave_dir = np.where(np.isnan(wave_dir), 0.0, wave_dir)
+    wave_period = np.where(np.isnan(wave_period), 6.0, wave_period)
+    wind_speed = np.where(np.isnan(wind_speed), 5.0, wind_speed)
+    wind_dir = np.where(np.isnan(wind_dir), 0.0, wind_dir)
+    
+    # Convert wind speed/direction to u/v components
+    wind_dir_rad = np.radians(wind_dir)
+    wind_u = -wind_speed * np.sin(wind_dir_rad)
+    wind_v = -wind_speed * np.cos(wind_dir_rad)
+    
+    # Build dataset
+    depths = np.array([0.0, 10.0])
+    heights = np.array([10.0])
+    n_depths = len(depths)
+    
+    wind_u_4d = np.expand_dims(wind_u, axis=1)
+    wind_v_4d = np.expand_dims(wind_v, axis=1)
+    
+    ds = xr.Dataset({
+        'thetao': (['time', 'depth', 'latitude', 'longitude'], np.full((n_times, n_depths, n_lats, n_lons), 15.0)),
+        'so': (['time', 'depth', 'latitude', 'longitude'], np.full((n_times, n_depths, n_lats, n_lons), 35.0)),
+        'uo': (['time', 'depth', 'latitude', 'longitude'], np.zeros((n_times, n_depths, n_lats, n_lons))),
+        'vo': (['time', 'depth', 'latitude', 'longitude'], np.zeros((n_times, n_depths, n_lats, n_lons))),
+        'utotal': (['time', 'depth', 'latitude', 'longitude'], np.zeros((n_times, n_depths, n_lats, n_lons))),
+        'vtotal': (['time', 'depth', 'latitude', 'longitude'], np.zeros((n_times, n_depths, n_lats, n_lons))),
+        'VHM0': (['time', 'latitude', 'longitude'], wave_height),
+        'VMDR': (['time', 'latitude', 'longitude'], wave_dir),
+        'VTPK': (['time', 'latitude', 'longitude'], wave_period),
+        'Pressure_reduced_to_MSL_msl': (['time', 'latitude', 'longitude'], np.full((n_times, n_lats, n_lons), 101325.0)),
+        'Temperature_surface': (['time', 'latitude', 'longitude'], np.full((n_times, n_lats, n_lons), 288.0)),
+        'u-component_of_wind_height_above_ground': (['time', 'height_above_ground', 'latitude', 'longitude'], wind_u_4d),
+        'v-component_of_wind_height_above_ground': (['time', 'height_above_ground', 'latitude', 'longitude'], wind_v_4d),
+        'u': (['time', 'latitude', 'longitude'], wind_u),
+        'v': (['time', 'latitude', 'longitude'], wind_v),
+    }, coords={
+        'time': times,
+        'depth': depths.astype(np.float64),
+        'height_above_ground': heights.astype(np.float64),
+        'latitude': lats.astype(np.float64),
+        'longitude': lons.astype(np.float64),
+    })
+    
+    # Add units
+    for var, unit in [('thetao', 'degrees_C'), ('so', '1e-3'), ('uo', 'm/s'), ('vo', 'm/s'),
+                      ('utotal', 'm/s'), ('vtotal', 'm/s'), ('VHM0', 'm'), ('VMDR', 'degree'),
+                      ('VTPK', 's'), ('Pressure_reduced_to_MSL_msl', 'Pa'), ('Temperature_surface', 'K'),
+                      ('u-component_of_wind_height_above_ground', 'm/s'),
+                      ('v-component_of_wind_height_above_ground', 'm/s'), ('u', 'm/s'), ('v', 'm/s')]:
+        ds[var].attrs['units'] = unit
+    
+    return ds
 
 
 # ============================================================
@@ -1051,8 +1375,51 @@ async def run_single_routing_pass(
         print(f"[Weather:{pass_id}] Fetching real weather from OpenMeteo...", flush=True)
         try:
             # Fetch enough days to cover the forecast window
-            forecast_days = max(7, (time_forecast // 24) + 1)
-            weather_ds = fetch_marine_grid(lat_min, lat_max, lon_min, lon_max, resolution=1.0, forecast_days=forecast_days)
+            # Note: OpenMeteo has 16-day limit, so we cap at 16 days for API
+            forecast_days = min(16, max(7, (time_forecast // 24) + 1))
+            
+            # Use corridor-based fetching for routes with waypoints
+            # This is much more efficient for long routes
+            if route_points and len(route_points) >= 2:
+                # Calculate route distance to determine corridor parameters
+                from geographiclib.geodesic import Geodesic
+                geod = Geodesic.WGS84
+                total_dist_km = 0
+                for i in range(len(route_points) - 1):
+                    g = geod.Inverse(route_points[i][0], route_points[i][1],
+                                    route_points[i+1][0], route_points[i+1][1])
+                    total_dist_km += g['s12'] / 1000.0
+                
+                # Adaptive corridor parameters based on route length
+                if total_dist_km > 5000:  # > 2700nm - long oceanic route
+                    corridor_width = 300.0  # km - wider for uncertainty
+                    point_spacing = 150.0   # km - coarser for efficiency
+                    weather_res = 1.5       # Coarser resolution for huge distances
+                elif total_dist_km > 2000:  # > 1000nm
+                    corridor_width = 250.0
+                    point_spacing = 100.0
+                    weather_res = 1.0
+                else:  # Shorter routes
+                    corridor_width = 200.0
+                    point_spacing = 75.0
+                    weather_res = 1.0
+                
+                print(f"[Weather:{pass_id}] Using corridor fetch: {total_dist_km:.0f}km route, "
+                      f"{corridor_width}km width, {point_spacing}km spacing, {weather_res}° res", flush=True)
+                
+                weather_ds = fetch_marine_corridor(
+                    waypoints=route_points,
+                    corridor_width_km=corridor_width,
+                    point_spacing_km=point_spacing,
+                    weather_resolution=weather_res,
+                    forecast_days=forecast_days,
+                    map_bounds=(lat_min, lon_min, lat_max, lon_max)  # Pass map bounds for WRT validation
+                )
+            else:
+                # Fallback to full grid fetch (for routes without pre-computed waypoints)
+                print(f"[Weather:{pass_id}] Using full grid fetch (no waypoints available)", flush=True)
+                weather_ds = fetch_marine_grid(lat_min, lat_max, lon_min, lon_max, resolution=1.0, forecast_days=forecast_days)
+            
             weather_path = f"{DATA_DIR}/weather_{pass_id}.nc"
             with netcdf_lock:
                 weather_ds.to_netcdf(weather_path)
@@ -1377,6 +1744,11 @@ async def calculate_route(request: RouteRequest):
         real_weather_forecast_hours = min(real_weather_forecast_hours, 144)  # Max 6 days (OpenMeteo limit)
         print(f"[Route] Auto-sized forecast window from calm route: {calm_time:.1f}h -> {real_weather_forecast_hours}h", flush=True)
     
+    # Use the calm route as the corridor for weather fetching (much more efficient)
+    # calm_coords is a list of [lat, lon] arrays - convert to (lat, lon) tuples
+    corridor_points = [(p[0], p[1]) for p in calm_coords]
+    print(f"[Route] Using calm route as weather corridor: {len(corridor_points)} waypoints", flush=True)
+    
     real_result = await run_single_routing_pass(
         request=request,
         weather_source="real",
@@ -1388,13 +1760,15 @@ async def calculate_route(request: RouteRequest):
         algorithm=algorithm,
         time_forecast_hours=real_weather_forecast_hours,
         route_distance_nm=gc_distance_nm,
-        route_points=route_points
+        route_points=corridor_points  # Use calm route as corridor, not original waypoints
     )
     
     if not real_result.get("success"):
         # If real weather fails, return calm route with error note
         exec_time = (time.time() - start_time) * 1000
-        print(f"[Route] Real weather routing failed, returning calm route only", flush=True)
+        error_msg = real_result.get("error", "Unknown error")
+        print(f"[Route] Real weather routing failed: {error_msg}", flush=True)
+        print(f"[Route] Returning calm route only", flush=True)
         return debug_log_response(RouteResponse(
             success=True,
             route=calm_route,
@@ -1403,7 +1777,7 @@ async def calculate_route(request: RouteRequest):
             execution_time_ms=exec_time,
             weather_cached=True,
             algorithm_used=algorithm,
-            weather_source_used="calm (real weather fetch failed)"
+            weather_source_used=f"calm (real weather failed: {error_msg})"
         ))
     
     real_coords = real_result["coords"]
