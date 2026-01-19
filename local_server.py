@@ -150,11 +150,35 @@ def route_passes_near_land(route_points: list, threshold_km: float = 150.0) -> b
     return False
 
 
+def is_route_in_pacific_nw(route_points: list) -> bool:
+    """
+    Check if all route points are within the Pacific Northwest region.
+    
+    Pacific NW bounds: lat 47-60, lon -140 to -122
+    """
+    if not route_points:
+        return False
+    
+    PACIFIC_NW_BOUNDS = {
+        "lat_min": 47.0,
+        "lat_max": 60.0,
+        "lon_min": -140.0,
+        "lon_max": -122.0,
+    }
+    
+    for lat, lon in route_points:
+        if not (PACIFIC_NW_BOUNDS["lat_min"] <= lat <= PACIFIC_NW_BOUNDS["lat_max"] and
+                PACIFIC_NW_BOUNDS["lon_min"] <= lon <= PACIFIC_NW_BOUNDS["lon_max"]):
+            return False
+    return True
+
+
 def select_astar_resolution(route_distance_nm: float, route_points: list) -> float:
     """
-    Select optimal A* grid resolution based on route distance and land proximity.
+    Select optimal A* grid resolution based on route distance, region, and land proximity.
     
     Strategy:
+    - Pacific NW region: Use 0.02° (high-res regional graph with intricate coastlines)
     - Short routes (<200nm): Fine resolution (0.05°)
     - Medium routes (200-1000nm): Medium resolution (0.1°) 
     - Long routes (1000-5000nm): Coarse resolution (0.25°)
@@ -162,6 +186,11 @@ def select_astar_resolution(route_distance_nm: float, route_points: list) -> flo
       - If passes near land/straits: 1.0° (need connectivity through straits)
       - If open ocean only: 2.0° (can use coarse grid)
     """
+    # Check for Pacific NW region - use high-res regional graph
+    if route_points and is_route_in_pacific_nw(route_points):
+        print(f"[Resolution] Route is in Pacific NW - using regional 0.02° graph", flush=True)
+        return 0.02
+    
     if route_distance_nm is None or route_distance_nm < 200:
         return 0.05
     elif route_distance_nm < 1000:

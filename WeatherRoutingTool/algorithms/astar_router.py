@@ -40,6 +40,40 @@ GRAPH_CACHE_DIR = Path("/tmp/wrt_graph_cache")
 # Global graph filename pattern
 GLOBAL_GRAPH_PATTERN = "GLOBAL_OCEAN_{res}deg.gpickle"
 
+# Regional graph definitions (region name -> bounds and file pattern)
+REGIONAL_GRAPHS = {
+    "PACIFIC_NW": {
+        "bounds": {
+            "lat_min": 47.0,
+            "lat_max": 60.0,
+            "lon_min": -140.0,
+            "lon_max": -122.0,
+        },
+        "resolution": 0.02,  # High resolution for intricate coastline
+        "pattern": "PACIFIC_NW_0_02deg.patched.gpickle",  # Pre-patched for connectivity
+    }
+}
+
+
+def _find_regional_graph(lat_min: float, lat_max: float, lon_min: float, lon_max: float) -> Optional[Tuple[Path, str]]:
+    """
+    Find a pre-built regional graph that completely contains the route bounds.
+    
+    Returns:
+        (path, region_name) if found, None otherwise
+    """
+    for region_name, region_info in REGIONAL_GRAPHS.items():
+        bounds = region_info["bounds"]
+        # Check if route is completely within this region
+        if (bounds["lat_min"] <= lat_min and lat_max <= bounds["lat_max"] and
+            bounds["lon_min"] <= lon_min and lon_max <= bounds["lon_max"]):
+            
+            graph_path = GRAPH_CACHE_DIR / region_info["pattern"]
+            if graph_path.exists():
+                logger.info(f"A*: Route is in {region_name} region - using regional graph")
+                return (graph_path, region_name)
+    return None
+
 
 def _find_global_graph(resolution: float) -> Optional[Path]:
     """Find a pre-built global ocean graph matching the resolution."""
@@ -230,7 +264,7 @@ class AStarRouter(RoutingAlg):
             return None
     
     def _load_or_build_graph(self) -> nx.DiGraph:
-        """Load graph from cache, extract from global graph, or build it."""
+        """Load graph from cache, extract from regional/global graph, or build it."""
         cache_path = self._get_cache_path()
         
         # Option 1: Use regional cache if available
@@ -246,7 +280,18 @@ class AStarRouter(RoutingAlg):
             print(f"[A*] Loaded cached graph: {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges", flush=True)
             return self.graph
         
-        # Option 2: Try to extract from global graph (much faster than building)
+        # Option 2: Try to use a pre-built regional graph (best for intricate coastlines)
+        regional_result = _find_regional_graph(self.lat_min, self.lat_max, self.lon_min, self.lon_max)
+        if regional_result:
+            regional_path, region_name = regional_result
+            subgraph = self._extract_subgraph_from_global(regional_path)
+            if subgraph is not None:
+                self.graph = subgraph
+                print(f"[A*] Using {region_name} regional graph: {self.graph.number_of_nodes()} nodes", flush=True)
+                # Don't cache regional extracts - they're already fast
+                return self.graph
+        
+        # Option 3: Try to extract from global graph (much faster than building)
         global_path = _find_global_graph(self.grid_resolution)
         if global_path:
             subgraph = self._extract_subgraph_from_global(global_path)
@@ -263,7 +308,7 @@ class AStarRouter(RoutingAlg):
                 logger.info(f"A*: Saved extracted subgraph to cache: {cache_path}")
                 return self.graph
         
-        # Option 3: Build from scratch (slowest)
+        # Option 4: Build from scratch (slowest)
         logger.info(f"A*: Building graph (this may take several minutes)...")
         print(f"[A*] Building graph (this may take 30-40 minutes for large regions)...", flush=True)
         start = time.time()
@@ -460,34 +505,38 @@ class AStarRouter(RoutingAlg):
     def _edge_crosses_land(self, lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
         """Check if an edge crosses land.
         
-        For short edges (<100km), uses polygon detection if available.
-        For long edges (>=100km), always uses geodesic point sampling because:
-        - Polygon detection uses Cartesian LineStrings which diverge from geodesic paths
-        - The actual ship route follows a great circle, not a straight lat/lon line
+        Uses BOTH polygon detection (PostGIS) AND point sampling (global_land_mask)
+        to ensure maximum accuracy. Either method detecting land triggers rejection.
+        
+        For short edges (<100km), polygon detection alone is usually sufficient,
+        but we also do point sampling as a backup.
+        
+        For long edges (>=100km), we use both methods because:
+        - Polygon detection may use Cartesian approximation, but catches islands well
+        - Point sampling follows the geodesic but may miss narrow land masses
+        - global_land_mask has limited resolution (~1km) and can miss small islands
         """
         # Calculate edge length
         line = geod.InverseLine(lat1, lon1, lat2, lon2)
         edge_length_km = line.s13 / 1000.0
         
-        # For short edges, polygon detection is accurate enough
-        LONG_EDGE_THRESHOLD_KM = 100.0  # Above this, geodesic diverges significantly from Cartesian
-        
-        if edge_length_km < LONG_EDGE_THRESHOLD_KM and self.land_polygon_detector is not None:
+        # Step 1: Try polygon detection (most accurate for landmasses like Corsica/Sardinia)
+        if self.land_polygon_detector is not None:
             try:
                 result = self.land_polygon_detector.check_crossing(
                     np.array([lat1]), np.array([lon1]),
                     np.array([lat2]), np.array([lon2])
                 )
-                if result is not None and len(result) > 0:
-                    if result[0]:
-                        return True  # Polygon detected crossing
-                    # Polygon says no crossing - trust it for short edges
-                    return False
-            except Exception:
-                pass  # Fall through to point sampling
+                if result is not None and len(result) > 0 and result[0]:
+                    if edge_length_km > 100:
+                        logger.info(f"A*: Edge ({edge_length_km:.0f}km) crosses land (polygon detection): ({lat1:.2f},{lon1:.2f})->({lat2:.2f},{lon2:.2f})")
+                    return True  # Polygon detected crossing
+            except Exception as e:
+                logger.debug(f"A*: Polygon check failed, using point sampling: {e}")
         
-        # For long edges, OR if polygon check failed, use geodesic point sampling
-        # This correctly follows the great circle path the ship would actually take
+        # Step 2: Also do geodesic point sampling for backup
+        # This catches cases where the geodesic path differs from the Cartesian line
+        # and also provides redundancy if polygon detection missed something
         n = max(2, int(ceil(line.s13 / self.land_check_interval)))
         
         for i in range(n + 1):
